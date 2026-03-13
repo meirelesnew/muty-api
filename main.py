@@ -19,7 +19,11 @@ _client = None
 def get_db():
     global _client
     if _client is None:
-        _client = MongoClient(MONGO_URL)
+        _client = MongoClient(
+            MONGO_URL,
+            tls=True,
+            tlsAllowInvalidCertificates=True
+        )
     return _client["muty2026"]
 
 @app.get("/")
