@@ -19,7 +19,6 @@ _client = None
 def get_db():
     global _client
     if _client is None:
-        # Sem parâmetros extras — deixar a URL do ambiente controlar tudo
         _client = MongoClient(MONGO_URL)
     return _client["muty2026"]
 
