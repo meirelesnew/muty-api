@@ -28,6 +28,12 @@ def root():
 
 @app.get("/health")
 def health():
+    # Apenas verifica se a API está viva (sem tocar no banco)
+    return {"status": "ok", "app": "MUTY Transporte API"}
+
+@app.get("/health/db")
+def health_db():
+    # Verifica conexão com MongoDB separadamente
     try:
         get_db().command("ping")
         return {"status": "ok", "mongo": "conectado"}
