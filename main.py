@@ -1,45 +1,31 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
-from pydantic import BaseModel
-from typing import Any, Optional
+from typing import Any
 import os
 from datetime import datetime
 
 app = FastAPI(title="MUTY Transporte API", version="1.0.0")
 
-# CORS — permite o GitHub Pages chamar a API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Em produção: ["https://meirelesnew.github.io"]
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# MongoDB Atlas — connection string via variável de ambiente
 MONGO_URL = os.environ.get("MONGO_URL", "")
-client = None
-db = None
+_client = None
 
 def get_db():
-    global client, db
-    if client is None:
-        client = MongoClient(MONGO_URL)
-        db = client["muty2026"]
-    return db
-
-# ── MODELS ──────────────────────────────────────────────────────────────────
-
-class DadosRequest(BaseModel):
-    dados: Any
-
-# ── HEALTH CHECK ─────────────────────────────────────────────────────────────
+    global _client
+    if _client is None:
+        _client = MongoClient(MONGO_URL)
+    return _client["muty2026"]
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "MUTY Transporte API", "version": "1.0.0"}
+    return {"status": "ok", "app": "MUTY Transporte API"}
 
 @app.get("/health")
 def health():
@@ -48,69 +34,6 @@ def health():
         return {"status": "ok", "mongo": "conectado"}
     except Exception as e:
         return {"status": "erro", "mongo": str(e)}
-
-# ── PAGAMENTOS ───────────────────────────────────────────────────────────────
-
-@app.get("/pagamentos")
-def get_pagamentos():
-    db = get_db()
-    doc = db.dados.find_one({"_id": "pagamentos"})
-    return {"dados": doc["dados"] if doc else {}}
-
-@app.put("/pagamentos")
-def save_pagamentos(req: DadosRequest):
-    db = get_db()
-    db.dados.update_one(
-        {"_id": "pagamentos"},
-        {"$set": {"dados": req.dados, "updated_at": datetime.utcnow()}},
-        upsert=True
-    )
-    return {"ok": True}
-
-# ── DESPESAS ─────────────────────────────────────────────────────────────────
-
-@app.get("/despesas")
-def get_despesas():
-    db = get_db()
-    doc = db.dados.find_one({"_id": "despesas"})
-    return {"dados": doc["dados"] if doc else []}
-
-@app.put("/despesas")
-def save_despesas(req: DadosRequest):
-    db = get_db()
-    db.dados.update_one(
-        {"_id": "despesas"},
-        {"$set": {"dados": req.dados, "updated_at": datetime.utcnow()}},
-        upsert=True
-    )
-    return {"ok": True}
-
-# ── CLIENTES ─────────────────────────────────────────────────────────────────
-
-@app.get("/clientes")
-def get_clientes():
-    db = get_db()
-    doc = db.dados.find_one({"_id": "clientes"})
-    clientes = doc["dados"] if doc else []
-    # Ordenar alfabeticamente
-    clientes_sorted = sorted(clientes, key=lambda c: c.get("nome", "").lower())
-    return {"dados": clientes_sorted}
-
-@app.put("/clientes")
-def save_clientes(req: DadosRequest):
-    db = get_db()
-    # Ordenar antes de salvar
-    clientes = req.dados
-    if isinstance(clientes, list):
-        clientes = sorted(clientes, key=lambda c: c.get("nome", "").lower())
-    db.dados.update_one(
-        {"_id": "clientes"},
-        {"$set": {"dados": clientes, "updated_at": datetime.utcnow()}},
-        upsert=True
-    )
-    return {"ok": True}
-
-# ── TODOS OS DADOS DE UMA VEZ (carregamento inicial) ─────────────────────────
 
 @app.get("/todos")
 def get_todos():
@@ -123,3 +46,45 @@ def get_todos():
         "despesas":   docs.get("despesas", []),
         "clientes":   clientes_sorted,
     }
+
+@app.get("/pagamentos")
+def get_pagamentos():
+    db = get_db()
+    doc = db.dados.find_one({"_id": "pagamentos"})
+    return {"dados": doc["dados"] if doc else {}}
+
+@app.get("/despesas")
+def get_despesas():
+    db = get_db()
+    doc = db.dados.find_one({"_id": "despesas"})
+    return {"dados": doc["dados"] if doc else []}
+
+@app.get("/clientes")
+def get_clientes():
+    db = get_db()
+    doc = db.dados.find_one({"_id": "clientes"})
+    clientes = doc["dados"] if doc else []
+    return {"dados": sorted(clientes, key=lambda c: c.get("nome", "").lower())}
+
+@app.put("/pagamentos")
+async def save_pagamentos(request: Request):
+    dados = await request.json()
+    db = get_db()
+    db.dados.update_one({"_id": "pagamentos"}, {"$set": {"dados": dados, "ts": datetime.utcnow()}}, upsert=True)
+    return {"ok": True}
+
+@app.put("/despesas")
+async def save_despesas(request: Request):
+    dados = await request.json()
+    db = get_db()
+    db.dados.update_one({"_id": "despesas"}, {"$set": {"dados": dados, "ts": datetime.utcnow()}}, upsert=True)
+    return {"ok": True}
+
+@app.put("/clientes")
+async def save_clientes(request: Request):
+    dados = await request.json()
+    db = get_db()
+    if isinstance(dados, list):
+        dados = sorted(dados, key=lambda c: c.get("nome", "").lower())
+    db.dados.update_one({"_id": "clientes"}, {"$set": {"dados": dados, "ts": datetime.utcnow()}}, upsert=True)
+    return {"ok": True}
