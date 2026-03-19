@@ -179,7 +179,8 @@ async def register(request: Request):
 
     except Exception as e:
         print(f"[AUTH] Erro register: {e}")
-        return {"status": "error", "message": "Erro interno"}
+        import traceback; traceback.print_exc()
+        return {"status": "error", "message": f"Erro interno: {str(e)}"}
 
 
 @app.post("/v2/login")
@@ -215,7 +216,8 @@ async def login(request: Request):
 
     except Exception as e:
         print(f"[AUTH] Erro login: {e}")
-        return {"status": "error", "message": "Erro interno"}
+        import traceback; traceback.print_exc()
+        return {"status": "error", "message": f"Erro interno: {str(e)}"}
 
 
 @app.get("/v2/me")
