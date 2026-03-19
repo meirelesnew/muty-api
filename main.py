@@ -36,13 +36,16 @@ pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_ = HTTPBearer(auto_error=False)
 
 def hash_senha(senha: str) -> str:
+    # Garantir string limpa, máx 72 bytes (limite bcrypt)
+    senha = str(senha).strip()[:72]
     return pwd_ctx.hash(senha)
 
 def verificar_senha(senha: str, hashed: str) -> bool:
-    # BUG CORRIGIDO: bcrypt pode lançar exceção em hashes malformados
     try:
+        senha = str(senha).strip()[:72]
         return pwd_ctx.verify(senha, hashed)
-    except Exception:
+    except Exception as e:
+        print(f"[AUTH] Erro verificar_senha: {e}")
         return False
 
 def criar_token(user_id: str, email: str) -> str:
