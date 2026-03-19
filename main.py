@@ -17,33 +17,24 @@ from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
 
 # ── JWT + bcrypt ───────────────────────────────────────────────────────────────
-# BUG CORRIGIDO: python-jose falha com Python 3.14 em alguns builds.
-# Substituído por PyJWT que é mais estável e sem dependência de Rust.
-try:
-    import jwt as pyjwt          # PyJWT
-    JWT_LIB = "pyjwt"
-except ImportError:
-    from jose import jwt as pyjwt
-    JWT_LIB = "jose"
-
-from passlib.context import CryptContext
+import jwt as pyjwt   # PyJWT — mais estável com Python 3.14
+import bcrypt         # bcrypt direto — sem passlib (evita bug 72 bytes)
 
 SECRET_KEY  = os.environ.get("JWT_SECRET", "muty-secret-dev-2026-TROCAR-em-producao")
 ALGORITHM   = "HS256"
 TOKEN_HOURS = 8
 
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_ = HTTPBearer(auto_error=False)
 
 def hash_senha(senha: str) -> str:
-    # Garantir string limpa, máx 72 bytes (limite bcrypt)
-    senha = str(senha).strip()[:72]
-    return pwd_ctx.hash(senha)
+    senha_bytes = str(senha).encode("utf-8")
+    return bcrypt.hashpw(senha_bytes, bcrypt.gensalt()).decode("utf-8")
 
 def verificar_senha(senha: str, hashed: str) -> bool:
     try:
-        senha = str(senha).strip()[:72]
-        return pwd_ctx.verify(senha, hashed)
+        senha_bytes  = str(senha).encode("utf-8")
+        hashed_bytes = str(hashed).encode("utf-8")
+        return bcrypt.checkpw(senha_bytes, hashed_bytes)
     except Exception as e:
         print(f"[AUTH] Erro verificar_senha: {e}")
         return False
