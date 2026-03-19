@@ -42,14 +42,10 @@ def verificar_senha(senha: str, hashed: str) -> bool:
 def criar_token(user_id: str, email: str) -> str:
     expire  = datetime.utcnow() + timedelta(hours=TOKEN_HOURS)
     payload = {"sub": user_id, "email": email, "exp": expire}
-    if JWT_LIB == "pyjwt":
-        return pyjwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
     return pyjwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 def decodificar_token(token: str) -> dict:
     try:
-        if JWT_LIB == "pyjwt":
-            return pyjwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return pyjwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except Exception:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
