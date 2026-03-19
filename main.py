@@ -8,7 +8,11 @@ import re
 import uuid
 import httpx
 import traceback
+import secrets
 from datetime import datetime, timedelta
+
+import resend
+from email_validator import validate_email, EmailNotValidError
 
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,11 +24,100 @@ from pymongo.errors import DuplicateKeyError
 import jwt as pyjwt   # PyJWT — mais estável com Python 3.14
 import bcrypt         # bcrypt direto — sem passlib (evita bug 72 bytes)
 
-SECRET_KEY  = os.environ.get("JWT_SECRET", "muty-secret-dev-2026-TROCAR-em-producao")
-ALGORITHM   = "HS256"
-TOKEN_HOURS = 8
+SECRET_KEY      = os.environ.get("JWT_SECRET",    "muty-secret-dev-2026-TROCAR-em-producao")
+RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
+FRONTEND_URL    = os.environ.get("FRONTEND_URL",   "https://meirelesnew.github.io/muty-transporte-2026")
+ALGORITHM       = "HS256"
+TOKEN_HOURS     = 8
+VERIFY_HOURS    = 24  # token de verificação de email expira em 24h
+
+resend.api_key = RESEND_API_KEY
 
 bearer_ = HTTPBearer(auto_error=False)
+
+# ── Validação de email ─────────────────────────────────────────────────────────
+def validar_email(email: str) -> tuple[bool, str]:
+    """
+    Valida formato e domínio do email.
+    Retorna (True, email_normalizado) ou (False, mensagem_erro)
+    """
+    try:
+        info = validate_email(email, check_deliverability=False)
+        return True, info.normalized
+    except EmailNotValidError as e:
+        return False, str(e)
+
+# ── Validação de senha forte ───────────────────────────────────────────────────
+def validar_senha(senha: str) -> tuple[bool, str]:
+    """
+    Valida requisitos de senha forte.
+    Retorna (True, "") ou (False, mensagem_de_erro)
+    """
+    if len(senha) < 6:
+        return False, "Senha deve ter no mínimo 6 caracteres"
+    if not re.search(r'[A-Z]', senha):
+        return False, "Senha deve ter pelo menos 1 letra maiúscula"
+    if not re.search(r'[a-z]', senha):
+        return False, "Senha deve ter pelo menos 1 letra minúscula"
+    if not re.search(r'\d', senha):
+        return False, "Senha deve ter pelo menos 1 número"
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>\-_=+\[\];\'`~/\\]', senha):
+        return False, "Senha deve ter pelo menos 1 caractere especial (!@#$%...)"
+    return True, ""
+
+# ── Envio de email via Resend ──────────────────────────────────────────────────
+def enviar_email_verificacao(email: str, nome: str, token: str) -> bool:
+    """
+    Envia email de verificação via Resend.com
+    Retorna True se enviou, False se falhou.
+    """
+    if not RESEND_API_KEY:
+        # Modo desenvolvimento: apenas loga o link
+        print(f"[EMAIL-DEV] Link verificação para {email}:")
+        print(f"[EMAIL-DEV] {FRONTEND_URL}/verificar?token={token}")
+        return True
+
+    try:
+        link = f"https://muty-api.onrender.com/v2/verify-email?token={token}"
+        params = {
+            "from":    "MUTY Transporte <noreply@resend.dev>",
+            "to":      [email],
+            "subject": "✅ Confirme seu cadastro — MUTY Transporte",
+            "html":    f"""
+            <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;
+                        background:#0a0e17;color:#e2e8f0;padding:32px;border-radius:16px;">
+              <div style="text-align:center;margin-bottom:24px;">
+                <div style="font-size:48px;">🚌</div>
+                <h1 style="font-family:Impact,sans-serif;letter-spacing:2px;
+                           color:#f59e0b;margin:8px 0;">MUTY TRANSPORTE</h1>
+              </div>
+              <h2 style="color:#e2e8f0;font-size:18px;">Olá, {nome}! 👋</h2>
+              <p style="color:#94a3b8;line-height:1.6;">
+                Seu cadastro foi criado com sucesso. Clique no botão abaixo
+                para confirmar seu email e ativar sua conta.
+              </p>
+              <div style="text-align:center;margin:32px 0;">
+                <a href="{link}"
+                   style="background:#f59e0b;color:#000;padding:14px 32px;
+                          border-radius:10px;text-decoration:none;
+                          font-weight:bold;font-size:16px;letter-spacing:1px;">
+                  ✅ CONFIRMAR EMAIL
+                </a>
+              </div>
+              <p style="color:#64748b;font-size:12px;text-align:center;">
+                Este link expira em 24 horas.<br>
+                Se você não criou esta conta, ignore este email.
+              </p>
+            </div>
+            """
+        }
+        resend.Emails.send(params)
+        print(f"[EMAIL] Email enviado para {email}")
+        return True
+    except Exception as e:
+        print(f"[EMAIL] Erro ao enviar para {email}: {e}")
+        traceback.print_exc()
+        return False
 
 def hash_senha(senha: str) -> str:
     senha_bytes = str(senha).encode("utf-8")
@@ -202,52 +295,71 @@ async def save_clientes(request: Request):
 
 @app.post("/v2/register")
 async def register(request: Request):
-    """Cadastro de novo usuário com email único e senha bcrypt."""
+    """
+    Cadastro de novo usuário.
+    Valida email, senha forte, cria conta e envia email de verificação.
+    """
     try:
         body    = await request.json()
-        email   = str(body.get("email", "")).strip().lower()
+        email   = str(body.get("email", "")).strip()
         senha   = str(body.get("senha", ""))
         nome    = str(body.get("nome", "")).strip()
         empresa = str(body.get("empresa", "")).strip()
 
-        # Validações
-        if not email or "@" not in email or "." not in email:
-            return {"status": "error", "message": "Email inválido"}
-        if len(senha) < 6:
-            return {"status": "error", "message": "Senha deve ter no mínimo 6 caracteres"}
+        # ── Validar nome ──────────────────────────────────────────────────────
         if not nome:
             return {"status": "error", "message": "Nome é obrigatório"}
+
+        # ── Validar email com biblioteca ──────────────────────────────────────
+        ok_email, resultado_email = validar_email(email)
+        if not ok_email:
+            return {"status": "error", "message": f"Email inválido: {resultado_email}"}
+        email = resultado_email  # usa email normalizado (lowercase, sem espaços)
+
+        # ── Validar senha forte ───────────────────────────────────────────────
+        ok_senha, msg_senha = validar_senha(senha)
+        if not ok_senha:
+            return {"status": "error", "message": msg_senha}
 
         db      = get_db()
         user_id = str(uuid.uuid4())
 
-        # BUG CORRIGIDO: usar DuplicateKeyError do pymongo em vez de find_one
-        # evita race condition em cadastros simultâneos
+        # ── Token de verificação de email ─────────────────────────────────────
+        verify_token   = secrets.token_urlsafe(32)  # token seguro aleatório
+        verify_expira  = datetime.utcnow() + timedelta(hours=VERIFY_HOURS)
+
+        # ── Criar usuário no MongoDB ──────────────────────────────────────────
         try:
             db.users.insert_one({
-                "user_id":    user_id,
-                "email":      email,
-                "senha_hash": hash_senha(senha),
-                "nome":       nome,
-                "empresa":    empresa,
-                "plano":      "free",
-                "ativo":      True,
-                "created_at": datetime.utcnow(),
+                "user_id":          user_id,
+                "email":            email,
+                "senha_hash":       hash_senha(senha),
+                "nome":             nome,
+                "empresa":          empresa,
+                "plano":            "free",
+                "ativo":            True,
+                "is_verified":      False,          # conta não verificada ainda
+                "verify_token":     verify_token,   # token do link de verificação
+                "verify_expira":    verify_expira,  # expiração do token
+                "created_at":       datetime.utcnow(),
             })
         except DuplicateKeyError:
             return {"status": "error", "message": "Email já cadastrado"}
 
-        token = criar_token(user_id, email)
-        print(f"[AUTH] Cadastro: {email} | {nome} | {empresa}")
+        # ── Enviar email de verificação ───────────────────────────────────────
+        email_enviado = enviar_email_verificacao(email, nome, verify_token)
+
+        print(f"[AUTH] Cadastro: {email} | {nome} | email_enviado={email_enviado}")
         return {
             "status": "success",
             "data": {
-                "token":   token,
-                "user_id": user_id,
-                "nome":    nome,
-                "email":   email,
-                "empresa": empresa,
-                "expira_em": f"{TOKEN_HOURS} horas",
+                "user_id":       user_id,
+                "nome":          nome,
+                "email":         email,
+                "empresa":       empresa,
+                "is_verified":   False,
+                "email_enviado": email_enviado,
+                "mensagem":      "Cadastro criado! Verifique seu email para ativar a conta.",
             }
         }
 
@@ -276,6 +388,14 @@ async def login(request: Request):
 
         if not user.get("ativo", True):
             return {"status": "error", "message": "Conta desativada"}
+
+        # Bloquear login se email não foi verificado
+        if not user.get("is_verified", True):  # True = compatibilidade com contas antigas
+            return {
+                "status": "error",
+                "message": "Verifique seu email antes de fazer login. Reenviar verificação em /v2/resend-verify",
+                "code": "email_not_verified"
+            }
 
         token = criar_token(user["user_id"], email)
         print(f"[AUTH] Login: {email}")
@@ -367,6 +487,111 @@ async def save_despesas_v2(request: Request, user=Depends(get_current_user)):
         return {"status": "error", "message": "Formato inválido — esperado lista"}
     ok = _save_dados_v2(get_db(), user["user_id"], "despesas", dados)
     return {"status": "success" if ok else "error", "data": {"saved": ok}}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V2 — VERIFICAÇÃO DE EMAIL
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/v2/verify-email")
+async def verify_email(token: str):
+    """
+    Ativação de conta via link do email.
+    Usuário clica no link → conta é ativada → pode fazer login.
+    """
+    if not token:
+        return {"status": "error", "message": "Token não fornecido"}
+
+    db   = get_db()
+    user = db.users.find_one({"verify_token": token})
+
+    if not user:
+        return {"status": "error", "message": "Link de verificação inválido ou já utilizado"}
+
+    # Verificar expiração do token
+    if datetime.utcnow() > user.get("verify_expira", datetime.utcnow()):
+        # Token expirado — remover do banco mas manter conta
+        db.users.update_one(
+            {"verify_token": token},
+            {"$unset": {"verify_token": "", "verify_expira": ""}}
+        )
+        return {
+            "status": "error",
+            "message": "Link expirado. Solicite um novo em /v2/resend-verify"
+        }
+
+    # Ativar conta — remover token e marcar como verificado
+    db.users.update_one(
+        {"verify_token": token},
+        {"$set":   {"is_verified": True, "verified_at": datetime.utcnow()},
+         "$unset": {"verify_token": "", "verify_expira": ""}}
+    )
+
+    print(f"[AUTH] Conta verificada: {user['email']}")
+
+    # Retornar HTML amigável (usuário vê isso no navegador ao clicar no link)
+    from fastapi.responses import HTMLResponse
+    html = f"""<!DOCTYPE html>
+    <html><head><meta charset="UTF-8">
+    <meta http-equiv="refresh" content="4;url=https://meirelesnew.github.io/muty-transporte-2026">
+    <title>Conta Verificada</title>
+    <style>body{{font-family:Arial;background:#0a0e17;color:#e2e8f0;
+      display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}}
+    .box{{background:#111827;border:1px solid #1f2d42;border-radius:16px;
+      padding:40px;text-align:center;max-width:400px;}}
+    h1{{color:#10b981;font-size:2rem;}} p{{color:#94a3b8;}}
+    a{{color:#f59e0b;}} </style></head>
+    <body><div class="box">
+      <div style="font-size:4rem">✅</div>
+      <h1>Conta Verificada!</h1>
+      <p>Olá, <strong style="color:#e2e8f0">{user.get("nome","")}</strong>!</p>
+      <p>Sua conta foi ativada com sucesso.<br>
+         Você será redirecionado para o dashboard em instantes.</p>
+      <p><a href="https://meirelesnew.github.io/muty-transporte-2026">
+         Clique aqui se não for redirecionado</a></p>
+    </div></body></html>"""
+    return HTMLResponse(content=html)
+
+
+@app.post("/v2/resend-verify")
+async def resend_verify(request: Request):
+    """
+    Reenviar email de verificação para contas não verificadas.
+    Útil quando o link expirou.
+    """
+    try:
+        body  = await request.json()
+        email = str(body.get("email", "")).strip().lower()
+
+        if not email:
+            return {"status": "error", "message": "Email obrigatório"}
+
+        db   = get_db()
+        user = db.users.find_one({"email": email})
+
+        # Segurança: não revelar se email existe ou não
+        if not user:
+            return {"status": "success", "message": "Se o email existir, você receberá um novo link."}
+
+        if user.get("is_verified"):
+            return {"status": "error", "message": "Esta conta já está verificada"}
+
+        # Gerar novo token
+        new_token  = secrets.token_urlsafe(32)
+        new_expira = datetime.utcnow() + timedelta(hours=VERIFY_HOURS)
+
+        db.users.update_one(
+            {"email": email},
+            {"$set": {"verify_token": new_token, "verify_expira": new_expira}}
+        )
+
+        enviar_email_verificacao(email, user.get("nome", ""), new_token)
+        return {"status": "success", "message": "Novo link de verificação enviado para seu email."}
+
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Erro: {str(e)}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
