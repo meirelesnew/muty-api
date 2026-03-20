@@ -135,7 +135,7 @@ def enviar_email_verificacao(email: str, nome: str, token: str) -> bool:
     return ok
 
 def enviar_email_reset_senha(email: str, nome: str, token: str) -> bool:
-    link = f"https://muty-api.onrender.com/v2/reset-password?token={token}"
+    link = f"{FRONTEND_URL}?reset_token={token}"
     html = _html_email(
         titulo   = f"Olá, {nome}! Redefinição de senha",
         nome     = nome,
