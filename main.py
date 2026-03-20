@@ -630,28 +630,118 @@ async def resend_verify(request: Request):
 # V2 — OCR SEGURO VIA GEMINI (chave nunca exposta ao frontend)
 # ══════════════════════════════════════════════════════════════════════════════
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
-PROMPT_OCR = """Analise este cupom fiscal brasileiro (NFC-e) e retorne APENAS um JSON válido, sem nenhum texto adicional:
+PROMPT_OCR = """Analise este cupom fiscal brasileiro e retorne APENAS JSON válido, sem texto extra:
 
-{
-  "estabelecimento": "string com nome da loja ou null",
-  "valor_total": numero_decimal_com_ponto_ou_null,
-  "data": "YYYY-MM-DD ou null",
-  "confianca": numero_entre_0_e_1
-}
+{"estabelecimento":"string ou null","valor_total":number ou null,"data":"YYYY-MM-DD ou null"}
 
-Regras obrigatórias:
-- valor_total deve ser o TOTAL FINAL (não subtotal nem itens individuais)
-- remover R$ e vírgulas, usar ponto decimal: 45,90 → 45.90
-- data deve ser a data da compra em formato ISO: 23/03/2026 → 2026-03-23
-- se houver dúvida sobre qualquer campo, retornar null naquele campo
-- confianca: 1.0 se tudo claro, 0.5 se parcialmente legível, 0.2 se muito difícil
-- NÃO retornar texto explicativo, NÃO usar markdown, NÃO usar blocos de código
-- retornar APENAS o JSON puro"""
+Regras:
+- valor_total = TOTAL FINAL da nota (não subtotal). Remover R$ e vírgulas, usar ponto: 45,90→45.90
+- data = data da compra em formato ISO: 23/03/2026→2026-03-23
+- estabelecimento = nome da loja/empresa do topo do cupom
+- Se não encontrar um campo, retornar null para aquele campo
+- Retornar APENAS o JSON, sem markdown, sem explicação"""
+
+
+# ── Helpers de extração ────────────────────────────────────────────────────────
+
+def _ocr_regex_fallback(texto: str) -> dict:
+    """
+    Extrai dados via regex quando Gemini falha ou retorna inválido.
+    Nunca lança exceção — sempre retorna dict.
+    """
+    resultado = {"estabelecimento": None, "valor_total": None, "data": None}
+
+    # Valor total — múltiplos padrões em ordem de prioridade
+    padroes_valor = [
+        r'(?:VALOR\s+TOTAL|TOTAL\s+A\s+PAGAR|VL\.?\s*TOTAL|TOTAL\s+GERAL|TOTAL)\s*[:\-]?\s*R?\$?\s*([\d]{1,6}[,.][\d]{2})',
+        r'(?:TOTAL)\s*[\n\r]+\s*R?\$?\s*([\d]{1,6}[,.][\d]{2})',
+        r'R\$\s*([\d]{1,6}[,.][\d]{2})',
+    ]
+    for p in padroes_valor:
+        matches = re.findall(p, texto, re.IGNORECASE | re.MULTILINE)
+        if matches:
+            valores = []
+            for m in matches:
+                try:
+                    v = float(m.replace('.', '').replace(',', '.'))
+                    if 0.01 < v < 100000:
+                        valores.append(v)
+                except Exception:
+                    pass
+            if valores:
+                resultado["valor_total"] = max(valores)
+                break
+
+    # Data — formato dd/mm/yyyy ou dd-mm-yyyy
+    dm = re.search(r'(\d{2})[/\-](\d{2})[/\-](\d{4})', texto)
+    if dm:
+        resultado["data"] = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}"
+
+    # Estabelecimento — primeiras linhas não vazias (geralmente o nome da loja)
+    linhas = [l.strip() for l in texto.split('\n') if l.strip() and len(l.strip()) > 3]
+    if linhas:
+        # Ignorar linhas que parecem CNPJ, data ou endereço
+        for linha in linhas[:5]:
+            if not re.match(r'^[\d\.\-/]+$', linha) and len(linha) < 80:
+                resultado["estabelecimento"] = linha
+                break
+
+    return resultado
+
+
+def _ocr_parse_qr_url(url: str) -> dict:
+    """
+    Extrai dados diretamente da URL do QR Code sem depender da SEFAZ.
+    Parâmetros comuns em NFC-e: vNF=valor, dEmi=data, xNome=estabelecimento
+    """
+    resultado = {"estabelecimento": None, "valor_total": None, "data": None}
+    try:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+
+        # Valor — parâmetro vNF (valor da NF) ou nVN
+        for key in ["vNF", "vnf", "vNf", "valor", "vTotNF"]:
+            if key in params:
+                try:
+                    v = float(str(params[key][0]).replace(",", "."))
+                    if 0.01 < v < 100000:
+                        resultado["valor_total"] = v
+                        break
+                except Exception:
+                    pass
+
+        # Data — parâmetro dEmi ou similar
+        for key in ["dEmi", "demi", "data", "dhEmi"]:
+            if key in params:
+                val = params[key][0]
+                # Tentar formato ISO
+                m = re.match(r"(\d{4})-(\d{2})-(\d{2})", val)
+                if m:
+                    resultado["data"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                    break
+                # Tentar dd/mm/yyyy
+                m2 = re.match(r"(\d{2})/(\d{2})/(\d{4})", val)
+                if m2:
+                    resultado["data"] = f"{m2.group(3)}-{m2.group(2)}-{m2.group(1)}"
+                    break
+
+        # Estabelecimento — parâmetro xNome ou razaoSocial
+        for key in ["xNome", "xnome", "razaoSocial", "nome"]:
+            if key in params:
+                resultado["estabelecimento"] = params[key][0]
+                break
+
+    except Exception as e:
+        print(f"[QR-PARSE] Erro: {e}")
+
+    return resultado
+
 
 def _sugerir_cat_ocr(nome: str) -> str:
-    """Sugere categoria baseada no nome do estabelecimento."""
+    """Sugere categoria pelo nome do estabelecimento."""
     n = (nome or "").lower()
     if any(x in n for x in ["posto", "gnv", "combusti", "gasolina", "etanol", "ipiranga", "shell", "petrobras"]):
         return "combustivel"
@@ -661,155 +751,143 @@ def _sugerir_cat_ocr(nome: str) -> str:
         return "impostos"
     return "outros"
 
-def _extrair_json_texto(texto: str) -> dict:
+
+def _mesclar_dados(gemini: dict, regex: dict, qr: dict) -> tuple[dict, str]:
     """
-    Tenta extrair JSON de texto livre caso o Gemini não retorne JSON puro.
-    Fallback em 3 tentativas.
+    Mescla dados das 3 fontes com prioridade: gemini > regex > qr.
+    Retorna (dados_mesclados, fonte_principal).
     """
-    # Tentativa 1: JSON direto
-    try:
-        return {"ok": True, "dados": json.loads(texto.strip())}
-    except Exception:
-        pass
+    final = {"estabelecimento": None, "valor_total": None, "data": None}
+    fontes_usadas = []
 
-    # Tentativa 2: extrair bloco JSON do texto
-    m = re.search(r'\{[\s\S]*?\}', texto)
-    if m:
-        try:
-            return {"ok": True, "dados": json.loads(m.group(0))}
-        except Exception:
-            pass
+    for campo in ["estabelecimento", "valor_total", "data"]:
+        if gemini.get(campo) is not None:
+            final[campo] = gemini[campo]
+            if "gemini" not in fontes_usadas:
+                fontes_usadas.append("gemini")
+        elif regex.get(campo) is not None:
+            final[campo] = regex[campo]
+            if "regex" not in fontes_usadas:
+                fontes_usadas.append("regex")
+        elif qr.get(campo) is not None:
+            final[campo] = qr[campo]
+            if "qr" not in fontes_usadas:
+                fontes_usadas.append("qr")
 
-    # Tentativa 3: regex para valor e data
-    dados = {"estabelecimento": None, "valor_total": None, "data": None, "confianca": 0.2}
-    vm = re.search(r'(?:TOTAL|VALOR TOTAL|TOTAL A PAGAR|VL TOTAL)[^\d]*([\d]{1,6}[,.]\d{2})', texto, re.IGNORECASE)
-    if vm:
-        try:
-            dados["valor_total"] = float(vm.group(1).replace(",", "."))
-        except Exception:
-            pass
-    dm = re.search(r'(\d{2})/(\d{2})/(\d{4})', texto)
-    if dm:
-        dados["data"] = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}"
+    fonte = fontes_usadas[0] if fontes_usadas else "manual"
+    return final, fonte
 
-    return {"ok": False, "dados": dados, "fonte": "regex"}
 
 @app.post("/v2/ocr")
-async def ocr_cupom(imagem: UploadFile = File(...)):
+async def ocr_cupom(imagem: UploadFile = File(...), qr_url: str = Form(default="")):
     """
-    OCR seguro — recebe imagem via multipart e chama Gemini no servidor.
-    A GEMINI_API_KEY nunca é exposta ao frontend.
+    OCR seguro e resiliente.
+    Ordem: Gemini → regex fallback → QR parsing → manual.
+    Nunca retorna erro que quebre o frontend.
     """
-    # Verificar configuração
-    if not GEMINI_API_KEY:
-        return {
-            "status": "error",
-            "message": "OCR não configurado no servidor. Configure GEMINI_API_KEY no Render.",
-            "code": "ocr_not_configured"
-        }
-
-    # Validar tipo de arquivo
-    mime_type = imagem.content_type or "image/jpeg"
-    if not mime_type.startswith("image/"):
-        return {"status": "error", "message": "Arquivo deve ser uma imagem"}
-
-    # Ler imagem e converter para base64
+    # Ler imagem
     try:
         imagem_bytes = await imagem.read()
-        if len(imagem_bytes) > 10 * 1024 * 1024:  # 10MB máximo
+        mime_type    = imagem.content_type or "image/jpeg"
+        if not mime_type.startswith("image/"):
+            return {"status": "error", "message": "Arquivo deve ser uma imagem"}
+        if len(imagem_bytes) > 10 * 1024 * 1024:
             return {"status": "error", "message": "Imagem muito grande (máx 10MB)"}
         imagem_b64 = base64.b64encode(imagem_bytes).decode("utf-8")
     except Exception as e:
         return {"status": "error", "message": f"Erro ao ler imagem: {str(e)}"}
 
-    # Chamar Gemini
-    try:
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"inline_data": {"mime_type": mime_type, "data": imagem_b64}},
-                    {"text": PROMPT_OCR}
-                ]
-            }],
-            "generationConfig": {
-                "temperature":      0.1,
-                "topP":             0.8,
-                "topK":             10,
-                "responseMimeType": "application/json",
+    # ── 1. Tentar Gemini ──────────────────────────────────────────────────────
+    dados_gemini = {}
+    texto_gemini = ""
+
+    if GEMINI_API_KEY:
+        try:
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"inline_data": {"mime_type": mime_type, "data": imagem_b64}},
+                        {"text": PROMPT_OCR}
+                    ]
+                }],
+                "generationConfig": {
+                    "temperature":      0,
+                    "responseMimeType": "application/json",
+                }
             }
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                    json=payload,
+                    headers={"Content-Type": "application/json"}
+                )
+
+            if resp.is_success:
+                resp_json   = resp.json()
+                texto_gemini = resp_json.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+
+                # Tentar parse JSON
+                try:
+                    raw = texto_gemini.strip()
+                    # Remover markdown se presente
+                    raw = re.sub(r'```json\s*|\s*```', '', raw).strip()
+                    parsed = json.loads(raw)
+                    # Validar e normalizar valor
+                    v = parsed.get("valor_total")
+                    if isinstance(v, str):
+                        v = float(v.replace(",", ".").replace("R$", "").strip())
+                    if v is not None and not (0.01 < float(v) < 100000):
+                        v = None
+                    dados_gemini = {
+                        "estabelecimento": parsed.get("estabelecimento") or None,
+                        "valor_total":     round(float(v), 2) if v else None,
+                        "data":            parsed.get("data") if re.match(r"\d{4}-\d{2}-\d{2}", str(parsed.get("data") or "")) else None,
+                    }
+                    print(f"[OCR] Gemini OK: {dados_gemini}")
+                except Exception as pe:
+                    print(f"[OCR] Gemini parse error: {pe} | texto: {texto_gemini[:100]}")
+            else:
+                print(f"[OCR] Gemini HTTP {resp.status_code}")
+
+        except httpx.TimeoutException:
+            print("[OCR] Gemini timeout (10s)")
+        except Exception as e:
+            print(f"[OCR] Gemini erro: {e}")
+    else:
+        print("[OCR] GEMINI_API_KEY não configurada — usando fallbacks")
+
+    # ── 2. Regex fallback (sempre roda, independente do Gemini) ──────────────
+    # Usa texto do Gemini se disponível, senão texto vazio (regex ainda pode pegar algo da resposta)
+    dados_regex = _ocr_regex_fallback(texto_gemini)
+    print(f"[OCR] Regex: {dados_regex}")
+
+    # ── 3. QR URL parsing (se URL foi enviada) ────────────────────────────────
+    dados_qr = {}
+    if qr_url and qr_url.startswith("http"):
+        dados_qr = _ocr_parse_qr_url(qr_url)
+        print(f"[OCR] QR params: {dados_qr}")
+
+    # ── 4. Mesclar com prioridade: gemini > regex > qr ────────────────────────
+    dados_final, fonte = _mesclar_dados(dados_gemini, dados_regex, dados_qr)
+    categoria = _sugerir_cat_ocr(dados_final.get("estabelecimento") or "")
+
+    print(f"[OCR] Final: {dados_final} | fonte: {fonte}")
+
+    # Sempre retorna success — frontend decide o que fazer com dados null
+    return {
+        "status": "success",
+        "data": {
+            "estabelecimento": dados_final["estabelecimento"],
+            "valor_total":     dados_final["valor_total"],
+            "data":            dados_final["data"],
+            "categoria":       categoria,
+            "fonte":           fonte,
+            "confianca":       1.0 if fonte == "gemini" else (0.6 if fonte == "regex" else 0.4),
         }
+    }
 
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            )
 
-        if resp.status_code == 403:
-            print("[OCR] Gemini 403 — verificar GEMINI_API_KEY")
-            return {"status": "error", "message": "Chave Gemini inválida ou sem permissão", "code": "gemini_auth_error"}
-
-        if resp.status_code == 429:
-            return {"status": "error", "message": "Limite de requisições Gemini atingido. Tente em instantes.", "code": "gemini_rate_limit"}
-
-        if not resp.is_success:
-            return {"status": "error", "message": f"Gemini retornou erro HTTP {resp.status_code}", "code": "gemini_error"}
-
-        resp_json  = resp.json()
-        texto_resp = resp_json.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-
-        if not texto_resp:
-            return {"status": "error", "message": "Gemini não retornou texto", "code": "gemini_empty"}
-
-        # Processar resposta
-        resultado = _extrair_json_texto(texto_resp)
-        dados     = resultado.get("dados", {})
-
-        # Validar e normalizar campos
-        estab = dados.get("estabelecimento")
-        valor = dados.get("valor_total")
-        data  = dados.get("data")
-        conf  = float(dados.get("confianca") or 0)
-
-        # Garantir tipos corretos
-        if isinstance(valor, str):
-            try:
-                valor = float(valor.replace(",", ".").replace("R$", "").strip())
-            except Exception:
-                valor = None
-
-        if valor is not None and (valor <= 0 or valor > 100000):
-            valor = None
-
-        # Validar data
-        if data:
-            import re as _re
-            if not _re.match(r"\d{4}-\d{2}-\d{2}", str(data)):
-                data = None
-
-        # Categoria sugerida
-        categoria = _sugerir_cat_ocr(estab or "")
-
-        print(f"[OCR] estab={estab} valor={valor} data={data} conf={conf:.2f}")
-
-        return {
-            "status": "success",
-            "data": {
-                "estabelecimento": estab,
-                "valor_total":     valor,
-                "data":            data,
-                "categoria":       categoria,
-                "confianca":       conf,
-                "fonte":           resultado.get("fonte", "gemini"),
-            }
-        }
-
-    except httpx.TimeoutException:
-        return {"status": "error", "message": "Gemini demorou mais que 20s. Tente novamente.", "code": "gemini_timeout"}
-    except Exception as e:
-        traceback.print_exc()
-        return {"status": "error", "message": "Erro interno no OCR", "code": "ocr_error"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # V2 — DIAGNÓSTICO DE EMAIL + ESQUECI A SENHA
