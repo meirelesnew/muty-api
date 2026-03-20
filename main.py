@@ -66,58 +66,85 @@ def validar_senha(senha: str) -> tuple[bool, str]:
     return True, ""
 
 # ── Envio de email via Resend ──────────────────────────────────────────────────
-def enviar_email_verificacao(email: str, nome: str, token: str) -> bool:
+def _html_email(titulo: str, nome: str, mensagem: str, link: str, btn_texto: str) -> str:
+    """Template HTML reutilizável para emails."""
+    return f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;
+                background:#0a0e17;color:#e2e8f0;padding:32px;border-radius:16px;">
+      <div style="text-align:center;margin-bottom:24px;">
+        <div style="font-size:48px;">🚌</div>
+        <h1 style="font-family:Impact,sans-serif;letter-spacing:2px;
+                   color:#f59e0b;margin:8px 0;">MUTY TRANSPORTE</h1>
+      </div>
+      <h2 style="color:#e2e8f0;font-size:18px;">{titulo}</h2>
+      <p style="color:#94a3b8;line-height:1.6;">{mensagem}</p>
+      <div style="text-align:center;margin:32px 0;">
+        <a href="{link}"
+           style="background:#f59e0b;color:#000;padding:14px 32px;
+                  border-radius:10px;text-decoration:none;
+                  font-weight:bold;font-size:16px;letter-spacing:1px;">
+          {btn_texto}
+        </a>
+      </div>
+      <p style="color:#475569;font-size:12px;margin-top:8px;">
+        Ou copie o link: <a href="{link}" style="color:#60a5fa;">{link}</a>
+      </p>
+      <p style="color:#64748b;font-size:11px;text-align:center;margin-top:24px;">
+        Este link expira em 24 horas. Se você não solicitou isso, ignore este email.
+      </p>
+    </div>
     """
-    Envia email de verificação via Resend.com
-    Retorna True se enviou, False se falhou.
+
+def _enviar_email(para: str, assunto: str, html: str) -> tuple[bool, str]:
+    """
+    Envia email via Resend.com.
+    Retorna (True, "") se ok ou (False, erro) se falhou.
     """
     if not RESEND_API_KEY:
-        # Modo desenvolvimento: apenas loga o link
-        print(f"[EMAIL-DEV] Link verificação para {email}:")
-        print(f"[EMAIL-DEV] {FRONTEND_URL}/verificar?token={token}")
-        return True
+        print(f"[EMAIL-DEV] RESEND_API_KEY não configurada")
+        print(f"[EMAIL-DEV] Para: {para} | Assunto: {assunto}")
+        return False, "RESEND_API_KEY não configurada no Render"
 
     try:
-        link = f"https://muty-api.onrender.com/v2/verify-email?token={token}"
-        params = {
-            "from":    "MUTY Transporte <noreply@resend.dev>",
-            "to":      [email],
-            "subject": "✅ Confirme seu cadastro — MUTY Transporte",
-            "html":    f"""
-            <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;
-                        background:#0a0e17;color:#e2e8f0;padding:32px;border-radius:16px;">
-              <div style="text-align:center;margin-bottom:24px;">
-                <div style="font-size:48px;">🚌</div>
-                <h1 style="font-family:Impact,sans-serif;letter-spacing:2px;
-                           color:#f59e0b;margin:8px 0;">MUTY TRANSPORTE</h1>
-              </div>
-              <h2 style="color:#e2e8f0;font-size:18px;">Olá, {nome}! 👋</h2>
-              <p style="color:#94a3b8;line-height:1.6;">
-                Seu cadastro foi criado com sucesso. Clique no botão abaixo
-                para confirmar seu email e ativar sua conta.
-              </p>
-              <div style="text-align:center;margin:32px 0;">
-                <a href="{link}"
-                   style="background:#f59e0b;color:#000;padding:14px 32px;
-                          border-radius:10px;text-decoration:none;
-                          font-weight:bold;font-size:16px;letter-spacing:1px;">
-                  ✅ CONFIRMAR EMAIL
-                </a>
-              </div>
-              <p style="color:#64748b;font-size:12px;text-align:center;">
-                Este link expira em 24 horas.<br>
-                Se você não criou esta conta, ignore este email.
-              </p>
-            </div>
-            """
+        resend.api_key = RESEND_API_KEY
+        params: resend.Emails.SendParams = {
+            "from":    "MUTY Transporte <onboarding@resend.dev>",
+            "to":      [para],
+            "subject": assunto,
+            "html":    html,
         }
-        resend.Emails.send(params)
-        print(f"[EMAIL] Email enviado para {email}")
-        return True
+        resultado = resend.Emails.send(params)
+        print(f"[EMAIL] Enviado para {para} | id={resultado.get('id','?')}")
+        return True, ""
     except Exception as e:
-        print(f"[EMAIL] Erro ao enviar para {email}: {e}")
+        erro = str(e)
+        print(f"[EMAIL] ERRO ao enviar para {para}: {erro}")
         traceback.print_exc()
-        return False
+        return False, erro
+
+def enviar_email_verificacao(email: str, nome: str, token: str) -> bool:
+    link = f"https://muty-api.onrender.com/v2/verify-email?token={token}"
+    html = _html_email(
+        titulo   = f"Olá, {nome}! 👋 Confirme seu cadastro",
+        nome     = nome,
+        mensagem = "Seu cadastro foi criado com sucesso. Clique no botão abaixo para confirmar seu email e ativar sua conta.",
+        link     = link,
+        btn_texto= "✅ CONFIRMAR EMAIL"
+    )
+    ok, _ = _enviar_email(email, "✅ Confirme seu cadastro — MUTY Transporte", html)
+    return ok
+
+def enviar_email_reset_senha(email: str, nome: str, token: str) -> bool:
+    link = f"https://muty-api.onrender.com/v2/reset-password?token={token}"
+    html = _html_email(
+        titulo   = f"Olá, {nome}! Redefinição de senha",
+        nome     = nome,
+        mensagem = "Recebemos uma solicitação para redefinir a senha da sua conta. Clique no botão abaixo para criar uma nova senha.",
+        link     = link,
+        btn_texto= "🔑 REDEFINIR SENHA"
+    )
+    ok, _ = _enviar_email(email, "🔑 Redefinir senha — MUTY Transporte", html)
+    return ok
 
 def hash_senha(senha: str) -> str:
     senha_bytes = str(senha).encode("utf-8")
@@ -588,6 +615,122 @@ async def resend_verify(request: Request):
 
         enviar_email_verificacao(email, user.get("nome", ""), new_token)
         return {"status": "success", "message": "Novo link de verificação enviado para seu email."}
+
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Erro: {str(e)}"}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V2 — DIAGNÓSTICO DE EMAIL + ESQUECI A SENHA
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/v2/debug-email")
+async def debug_email():
+    """
+    Diagnóstico: verifica se RESEND_API_KEY está configurada.
+    Não envia email — apenas verifica a configuração.
+    """
+    chave = RESEND_API_KEY
+    if not chave:
+        return {
+            "status": "error",
+            "message": "RESEND_API_KEY não configurada no Render",
+            "solucao": "Acesse dashboard.render.com > muty-api > Environment > Add Variable: RESEND_API_KEY = re_XXXXXXXX"
+        }
+    return {
+        "status": "ok",
+        "resend_configurado": True,
+        "chave_preview": chave[:8] + "..." + chave[-4:],  # mostra só parte da chave
+        "frontend_url": FRONTEND_URL,
+    }
+
+
+@app.post("/v2/forgot-password")
+async def forgot_password(request: Request):
+    """
+    Esqueci a senha — envia email com link para redefinir.
+    Por segurança, sempre retorna a mesma mensagem (não revela se email existe).
+    """
+    try:
+        body  = await request.json()
+        email = str(body.get("email", "")).strip().lower()
+
+        ok_email, resultado = validar_email(email)
+        if not ok_email:
+            return {"status": "error", "message": "Email inválido"}
+
+        db   = get_db()
+        user = db.users.find_one({"email": resultado})
+
+        MSG_PADRAO = "Se este email estiver cadastrado, você receberá um link para redefinir sua senha."
+
+        if not user:
+            # Segurança: não revelar que o email não existe
+            return {"status": "success", "message": MSG_PADRAO}
+
+        # Gerar token de reset
+        reset_token  = secrets.token_urlsafe(32)
+        reset_expira = datetime.utcnow() + timedelta(hours=1)  # expira em 1 hora
+
+        db.users.update_one(
+            {"email": resultado},
+            {"$set": {"reset_token": reset_token, "reset_expira": reset_expira}}
+        )
+
+        enviado = enviar_email_reset_senha(resultado, user.get("nome", ""), reset_token)
+        print(f"[AUTH] Reset senha solicitado: {resultado} | email_enviado={enviado}")
+
+        return {"status": "success", "message": MSG_PADRAO}
+
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Erro: {str(e)}"}
+
+
+@app.post("/v2/reset-password")
+async def reset_password(request: Request):
+    """
+    Redefinir senha com o token recebido por email.
+    """
+    try:
+        body      = await request.json()
+        token     = str(body.get("token", "")).strip()
+        nova_senha = str(body.get("nova_senha", ""))
+
+        if not token:
+            return {"status": "error", "message": "Token obrigatório"}
+
+        # Validar nova senha
+        ok_senha, msg_senha = validar_senha(nova_senha)
+        if not ok_senha:
+            return {"status": "error", "message": msg_senha}
+
+        db   = get_db()
+        user = db.users.find_one({"reset_token": token})
+
+        if not user:
+            return {"status": "error", "message": "Link inválido ou já utilizado"}
+
+        if datetime.utcnow() > user.get("reset_expira", datetime.utcnow()):
+            db.users.update_one(
+                {"reset_token": token},
+                {"$unset": {"reset_token": "", "reset_expira": ""}}
+            )
+            return {"status": "error", "message": "Link expirado. Solicite um novo em /v2/forgot-password"}
+
+        # Atualizar senha e remover token
+        db.users.update_one(
+            {"reset_token": token},
+            {
+                "$set":   {"senha_hash": hash_senha(nova_senha), "updated_at": datetime.utcnow()},
+                "$unset": {"reset_token": "", "reset_expira": ""}
+            }
+        )
+
+        print(f"[AUTH] Senha redefinida: {user['email']}")
+        return {"status": "success", "message": "Senha redefinida com sucesso! Faça login com sua nova senha."}
 
     except Exception as e:
         traceback.print_exc()
