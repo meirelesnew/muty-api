@@ -763,37 +763,86 @@ def _detectar_estado(url: str) -> str:
             return uf
     return "GENERICO"
 
+def _limpar_html(texto: str) -> str:
+    """Remove tags HTML e espaços extras."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", texto)).strip()
+
 def _extrair_valor(html: str) -> float:
-    padroes = [
-        r'[Vv]alor\s+[Tt]otal\s*[:\-]?\s*R?\$?\s*([\d]+[.,][\d]{2})',
-        r'[Tt]otal\s+a\s+[Pp]agar\s*[:\-]?\s*R?\$?\s*([\d]+[.,][\d]{2})',
-        r'[Tt]otal\s*[:\-]?\s*R?\$?\s*([\d]+[.,][\d]{2})',
-        r'R\$\s*([\d]+[.,][\d]{2})',
+    """
+    Extrai valor total da NFC-e.
+    Tenta múltiplos padrões em ordem de prioridade.
+    """
+    # Padrão 1: atributos data-* usados por portais modernos
+    # ex: data-valor="125.90" ou data-total="125.90"
+    m = re.search(r'data-(?:valor|total|preco)["']?\s*[=:]\s*["']?([\d]+[.,][\d]{2})', html, re.IGNORECASE)
+    if m:
+        try:
+            v = float(m.group(1).replace(",", "."))
+            if 0.01 < v < 100000: return v
+        except: pass
+
+    # Padrão 2: campos específicos de NFC-e (estrutura comum das SEFAZs)
+    padroes_nfce = [
+        r'(?:Valor\s+Total|Total\s+da\s+Nota|Total\s+NF-e|Vl\.?\s*Total)\s*[:\-]?\s*R?\$?\s*([\d]{1,6}[.,][\d]{2})',
+        r'(?:TOTAL|Total\s+a\s+Pagar|Total\s+Pagar)\s*[:\-]?\s*R?\$?\s*([\d]{1,6}[.,][\d]{2})',
+        r'(?:Valor\s+a\s+Pagar|Pagar)\s*[:\-]?\s*R?\$?\s*([\d]{1,6}[.,][\d]{2})',
     ]
-    valores = []
-    for p in padroes:
-        for m in re.findall(p, html, re.IGNORECASE):
-            try:
-                valores.append(float(m.replace(".", "").replace(",", ".")))
-            except ValueError:
-                pass
-    # BUG CORRIGIDO: filtrar valores absurdos (ex: anos como 2026.00)
-    valores = [v for v in valores if 0.01 < v < 100000]
-    return max(valores) if valores else 0.0
+    for p in padroes_nfce:
+        matches = re.findall(p, html, re.IGNORECASE)
+        if matches:
+            valores = []
+            for m in matches:
+                try:
+                    v = float(m.replace(".", "").replace(",", "."))
+                    if 0.01 < v < 100000: valores.append(v)
+                except: pass
+            if valores: return max(valores)
+
+    # Padrão 3: qualquer R$ seguido de valor (fallback)
+    todos = []
+    for m in re.findall(r'R\$\s*([\d]{1,6}[.,][\d]{2})', html, re.IGNORECASE):
+        try:
+            v = float(m.replace(".", "").replace(",", "."))
+            if 0.01 < v < 100000: todos.append(v)
+        except: pass
+    if todos: return max(todos)
+
+    return 0.0
 
 def _extrair_estabelecimento(html: str) -> str:
-    padroes = [
-        r'<div[^>]*class="[^"]*NomeEmit[^"]*"[^>]*>(.*?)</div>',
-        r'<span[^>]*class="[^"]*emit[^"]*"[^>]*>(.*?)</span>',
-        r'Razão Social[:\s]*(.*?)<',
-        r'<strong[^>]*>(.*?)</strong>',
+    """
+    Extrai nome do estabelecimento da NFC-e.
+    Tenta múltiplos padrões compatíveis com diferentes SEFAZs.
+    """
+    # Padrão 1: classes CSS específicas de portais NFC-e
+    padroes_classe = [
+        r'<[^>]*class="[^"]*(?:NomeEmit|nome-emit|razaoSocial|nomeEmpresa|nome_emit)[^"]*"[^>]*>(.*?)</',
+        r'<[^>]*id="[^"]*(?:NomeEmit|nomeEmit|razaoSocial)[^"]*"[^>]*>(.*?)</',
     ]
-    for p in padroes:
+    for p in padroes_classe:
         m = re.search(p, html, re.IGNORECASE | re.DOTALL)
         if m:
-            texto = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
-            if 3 < len(texto) < 100:
-                return texto
+            texto = _limpar_html(m.group(1))
+            if 3 < len(texto) < 120: return texto
+
+    # Padrão 2: estrutura textual comum
+    padroes_texto = [
+        r'(?:Razão\s+Social|Emitente|Empresa)[:\s]+([A-Z][^<\n]{3,80})',
+        r'<title[^>]*>([^<]{5,80})</title>',
+    ]
+    for p in padroes_texto:
+        m = re.search(p, html, re.IGNORECASE)
+        if m:
+            texto = _limpar_html(m.group(1)).strip()
+            if 3 < len(texto) < 120: return texto
+
+    # Padrão 3: primeiro <strong> ou <h1> da página
+    for tag in [r'<h1[^>]*>(.*?)</h1>', r'<strong[^>]*>(.*?)</strong>']:
+        m = re.search(tag, html, re.IGNORECASE | re.DOTALL)
+        if m:
+            texto = _limpar_html(m.group(1))
+            if 3 < len(texto) < 120: return texto
+
     return "Estabelecimento"
 
 def _extrair_data(html: str) -> str:
