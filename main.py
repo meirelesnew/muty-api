@@ -640,7 +640,7 @@ from urllib.parse import urlparse, parse_qs as _parse_qs
 
 GEMINI_OCR_URL = (
     "https://generativelanguage.googleapis.com/v1beta"
-    "/models/gemini-1.5-flash:generateContent"
+    "/models/gemini-2.0-flash:generateContent"
 )
 
 PROMPT_OCR = (
