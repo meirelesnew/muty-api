@@ -630,263 +630,300 @@ async def resend_verify(request: Request):
 # V2 — OCR SEGURO VIA GEMINI (chave nunca exposta ao frontend)
 # ══════════════════════════════════════════════════════════════════════════════
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
-PROMPT_OCR = """Analise este cupom fiscal brasileiro e retorne APENAS JSON válido, sem texto extra:
+# ══════════════════════════════════════════════════════════════════════════════
+# OCR PIPELINE — QR → Gemini → Regex
+# ══════════════════════════════════════════════════════════════════════════════
 
-{"estabelecimento":"string ou null","valor_total":number ou null,"data":"YYYY-MM-DD ou null"}
+import re as _re
+from urllib.parse import urlparse, parse_qs as _parse_qs
 
-Regras:
-- valor_total = TOTAL FINAL da nota (não subtotal). Remover R$ e vírgulas, usar ponto: 45,90→45.90
-- data = data da compra em formato ISO: 23/03/2026→2026-03-23
-- estabelecimento = nome da loja/empresa do topo do cupom
-- Se não encontrar um campo, retornar null para aquele campo
-- Retornar APENAS o JSON, sem markdown, sem explicação"""
+GEMINI_OCR_URL = (
+    "https://generativelanguage.googleapis.com/v1beta"
+    "/models/gemini-1.5-flash:generateContent"
+)
 
+PROMPT_OCR = (
+    "Analise este cupom fiscal brasileiro e retorne APENAS JSON puro, "
+    "sem markdown, sem explicação:\n"
+    '{"estabelecimento":"string ou null",'
+    '"valor_total":number ou null,'
+    '"data":"YYYY-MM-DD ou null"}\n'
+    "Regras: valor_total = TOTAL FINAL (ignorar subtotais e itens individuais). "
+    "Converter vírgula para ponto: 45,90→45.90. "
+    "Data em ISO: 23/03/2026→2026-03-23. "
+    "Retornar null para campos não encontrados."
+)
 
-# ── Helpers de extração ────────────────────────────────────────────────────────
+# ── Normalização ──────────────────────────────────────────────────────────────
 
-def _ocr_regex_fallback(texto: str) -> dict:
-    """
-    Extrai dados via regex quando Gemini falha ou retorna inválido.
-    Nunca lança exceção — sempre retorna dict.
-    """
-    resultado = {"estabelecimento": None, "valor_total": None, "data": None}
-
-    # Valor total — múltiplos padrões em ordem de prioridade
-    padroes_valor = [
-        r'(?:VALOR\s+TOTAL|TOTAL\s+A\s+PAGAR|VL\.?\s*TOTAL|TOTAL\s+GERAL|TOTAL)\s*[:\-]?\s*R?\$?\s*([\d]{1,6}[,.][\d]{2})',
-        r'(?:TOTAL)\s*[\n\r]+\s*R?\$?\s*([\d]{1,6}[,.][\d]{2})',
-        r'R\$\s*([\d]{1,6}[,.][\d]{2})',
-    ]
-    for p in padroes_valor:
-        matches = re.findall(p, texto, re.IGNORECASE | re.MULTILINE)
-        if matches:
-            valores = []
-            for m in matches:
-                try:
-                    v = float(m.replace('.', '').replace(',', '.'))
-                    if 0.01 < v < 100000:
-                        valores.append(v)
-                except Exception:
-                    pass
-            if valores:
-                resultado["valor_total"] = max(valores)
-                break
-
-    # Data — formato dd/mm/yyyy ou dd-mm-yyyy
-    dm = re.search(r'(\d{2})[/\-](\d{2})[/\-](\d{4})', texto)
-    if dm:
-        resultado["data"] = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}"
-
-    # Estabelecimento — primeiras linhas não vazias (geralmente o nome da loja)
-    linhas = [l.strip() for l in texto.split('\n') if l.strip() and len(l.strip()) > 3]
-    if linhas:
-        # Ignorar linhas que parecem CNPJ, data ou endereço
-        for linha in linhas[:5]:
-            if not re.match(r'^[\d\.\-/]+$', linha) and len(linha) < 80:
-                resultado["estabelecimento"] = linha
-                break
-
-    return resultado
-
-
-def _ocr_parse_qr_url(url: str) -> dict:
-    """
-    Extrai dados diretamente da URL do QR Code sem depender da SEFAZ.
-    Parâmetros comuns em NFC-e: vNF=valor, dEmi=data, xNome=estabelecimento
-    """
-    resultado = {"estabelecimento": None, "valor_total": None, "data": None}
+def _norm_valor(v) -> float | None:
+    if v is None:
+        return None
     try:
-        from urllib.parse import urlparse, parse_qs
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query)
+        s = str(v).replace("R$", "").replace(" ", "").strip()
+        # 1.234,56 → 1234.56
+        if _re.match(r"^\d{1,3}(\.\d{3})+,\d{2}$", s):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", ".")
+        f = float(s)
+        return round(f, 2) if 0.01 < f < 100_000 else None
+    except Exception:
+        return None
 
-        # Valor — parâmetro vNF (valor da NF) ou nVN
-        for key in ["vNF", "vnf", "vNf", "valor", "vTotNF"]:
-            if key in params:
-                try:
-                    v = float(str(params[key][0]).replace(",", "."))
-                    if 0.01 < v < 100000:
-                        resultado["valor_total"] = v
-                        break
-                except Exception:
-                    pass
+def _norm_data(s) -> str | None:
+    s = str(s or "").strip()
+    if not s or s == "None":
+        return None
+    m = _re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = _re.match(r"(\d{2})[/\-](\d{2})[/\-](\d{4})", s)
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    return None
 
-        # Data — parâmetro dEmi ou similar
-        for key in ["dEmi", "demi", "data", "dhEmi"]:
-            if key in params:
-                val = params[key][0]
-                # Tentar formato ISO
-                m = re.match(r"(\d{4})-(\d{2})-(\d{2})", val)
-                if m:
-                    resultado["data"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-                    break
-                # Tentar dd/mm/yyyy
-                m2 = re.match(r"(\d{2})/(\d{2})/(\d{4})", val)
-                if m2:
-                    resultado["data"] = f"{m2.group(3)}-{m2.group(2)}-{m2.group(1)}"
-                    break
-
-        # Estabelecimento — parâmetro xNome ou razaoSocial
-        for key in ["xNome", "xnome", "razaoSocial", "nome"]:
-            if key in params:
-                resultado["estabelecimento"] = params[key][0]
-                break
-
-    except Exception as e:
-        print(f"[QR-PARSE] Erro: {e}")
-
-    return resultado
-
-
-def _sugerir_cat_ocr(nome: str) -> str:
-    """Sugere categoria pelo nome do estabelecimento."""
+def _sugerir_cat(nome: str) -> str:
     n = (nome or "").lower()
-    if any(x in n for x in ["posto", "gnv", "combusti", "gasolina", "etanol", "ipiranga", "shell", "petrobras"]):
+    if any(x in n for x in ["posto", "gnv", "combusti", "gasolina", "etanol",
+                              "ipiranga", "shell", "petrobras"]):
         return "combustivel"
-    if any(x in n for x in ["mecanica", "auto", "pneu", "borracha", "oficina", "manutencao"]):
+    if any(x in n for x in ["mecanica", "auto ", "pneu", "borracha",
+                              "oficina", "manutencao"]):
         return "manutencao"
     if any(x in n for x in ["detran", "ipva", "iptu", "multa", "tributo"]):
         return "impostos"
     return "outros"
 
+# ── Fonte 1: QR Code ──────────────────────────────────────────────────────────
 
-def _mesclar_dados(gemini: dict, regex: dict, qr: dict) -> tuple[dict, str]:
+def _qr_extrair(url: str) -> dict:
+    """Extrai vNF/dEmi/xNome diretamente da URL sem depender da SEFAZ."""
+    r = {"estabelecimento": None, "valor_total": None, "data": None}
+    if not url or not url.startswith("http"):
+        return r
+    try:
+        params = _parse_qs(urlparse(url).query)
+        for k in ["vNF", "vnf", "vNf", "vTotNF"]:
+            if k in params:
+                v = _norm_valor(params[k][0])
+                if v:
+                    r["valor_total"] = v
+                    break
+        for k in ["dEmi", "demi", "dhEmi"]:
+            if k in params:
+                d = _norm_data(params[k][0])
+                if d:
+                    r["data"] = d
+                    break
+        for k in ["xNome", "xnome", "razaoSocial"]:
+            if k in params:
+                nome = params[k][0]
+                if len(nome) > 2:
+                    r["estabelecimento"] = nome
+                    break
+        print(f"[QR] {r}")
+    except Exception as e:
+        print(f"[QR] erro: {e}")
+    return r
+
+# ── Fonte 2: Gemini ───────────────────────────────────────────────────────────
+
+async def _gemini_ocr(b64: str, mime: str, key: str) -> tuple[dict, str]:
     """
-    Mescla dados das 3 fontes com prioridade: gemini > regex > qr.
-    Retorna (dados_mesclados, fonte_principal).
+    Gemini 1.5-flash, temp=0, timeout=10s.
+    Retorna (dados, texto_bruto) — texto_bruto alimenta o regex fallback.
+    """
+    vazio = {"estabelecimento": None, "valor_total": None, "data": None}
+    if not key:
+        print("[GEMINI] sem chave")
+        return vazio, ""
+    try:
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": mime, "data": b64}},
+                    {"text": PROMPT_OCR}
+                ]
+            }],
+            "generationConfig": {
+                "temperature":      0,
+                "responseMimeType": "application/json",
+            }
+        }
+        async with httpx.AsyncClient(timeout=10) as cli:
+            resp = await cli.post(
+                f"{GEMINI_OCR_URL}?key={key}",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+
+        if not resp.is_success:
+            print(f"[GEMINI] HTTP {resp.status_code}")
+            return vazio, ""
+
+        texto = (resp.json()
+                 .get("candidates", [{}])[0]
+                 .get("content", {})
+                 .get("parts", [{}])[0]
+                 .get("text", ""))
+
+        # Parse JSON — limpar markdown se presente
+        clean = _re.sub(r"```json\s*|\s*```", "", texto).strip()
+        parsed = json.loads(clean)
+
+        dados = {
+            "estabelecimento": parsed.get("estabelecimento") or None,
+            "valor_total":     _norm_valor(parsed.get("valor_total")),
+            "data":            _norm_data(str(parsed.get("data") or "")),
+        }
+        print(f"[GEMINI] OK: {dados}")
+        return dados, texto
+
+    except httpx.TimeoutException:
+        print("[GEMINI] timeout 10s")
+        return vazio, ""
+    except json.JSONDecodeError as je:
+        print(f"[GEMINI] JSON inválido: {je} | texto[:80]={texto[:80]}")
+        return vazio, texto   # retorna texto bruto para regex
+    except Exception as e:
+        print(f"[GEMINI] erro: {e}")
+        return vazio, ""
+
+# ── Fonte 3: Regex ────────────────────────────────────────────────────────────
+
+def _regex_extrair(texto: str) -> dict:
+    """
+    Sempre executa se algum campo estiver faltando.
+    Funciona mesmo sem nenhuma API disponível.
+    """
+    r = {"estabelecimento": None, "valor_total": None, "data": None}
+    if not texto:
+        return r
+
+    # Valor — padrões em ordem de confiança decrescente
+    for p in [
+        r"(?:VALOR\s+TOTAL|TOTAL\s+A\s+PAGAR|VL\.?\s*TOTAL|TOTAL\s+GERAL)"
+        r"\s*[:\-]?\s*R?\$?\s*([\d]{1,3}(?:\.[\d]{3})*[,\.][\d]{2})",
+        r"(?<!\d)([\d]{1,3}(?:\.[\d]{3})*,[\d]{2})(?!\d)",
+        r"R\$\s*([\d]+[,\.][\d]{2})",
+    ]:
+        ms = _re.findall(p, texto, _re.IGNORECASE | _re.MULTILINE)
+        vs = [_norm_valor(m) for m in ms]
+        vs = [v for v in vs if v]
+        if vs:
+            r["valor_total"] = max(vs)
+            break
+
+    # Data
+    m = _re.search(r"(\d{2})[/\-](\d{2})[/\-](\d{4})", texto)
+    if m:
+        r["data"] = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+
+    # Estabelecimento — primeiras linhas não numéricas
+    linhas = [l.strip() for l in texto.split("\n")
+              if l.strip() and len(l.strip()) > 3
+              and not _re.match(r"^[\d\.\-/:\s]+$", l.strip())]
+    for linha in linhas[:6]:
+        if len(linha) < 80 and not _re.match(r"^\d{2}[/\-]\d{2}", linha):
+            r["estabelecimento"] = linha
+            break
+
+    print(f"[REGEX] {r}")
+    return r
+
+# ── Mesclagem ─────────────────────────────────────────────────────────────────
+
+def _mesclar(fontes: list[tuple[str, dict]]) -> tuple[dict, list[str]]:
+    """
+    Mescla resultados campo a campo com prioridade da lista.
+    Ex: Gemini trouxe valor, regex trouxe estabelecimento → ambos usados.
     """
     final = {"estabelecimento": None, "valor_total": None, "data": None}
-    fontes_usadas = []
+    usadas: list[str] = []
+    for nome, dados in fontes:
+        contribuiu = False
+        for campo in ["estabelecimento", "valor_total", "data"]:
+            if final[campo] is None and dados.get(campo) is not None:
+                final[campo] = dados[campo]
+                contribuiu = True
+        if contribuiu and nome not in usadas:
+            usadas.append(nome)
+        if all(final[c] is not None for c in final):
+            break   # todos preenchidos — parar
+    return final, usadas
 
-    for campo in ["estabelecimento", "valor_total", "data"]:
-        if gemini.get(campo) is not None:
-            final[campo] = gemini[campo]
-            if "gemini" not in fontes_usadas:
-                fontes_usadas.append("gemini")
-        elif regex.get(campo) is not None:
-            final[campo] = regex[campo]
-            if "regex" not in fontes_usadas:
-                fontes_usadas.append("regex")
-        elif qr.get(campo) is not None:
-            final[campo] = qr[campo]
-            if "qr" not in fontes_usadas:
-                fontes_usadas.append("qr")
-
-    fonte = fontes_usadas[0] if fontes_usadas else "manual"
-    return final, fonte
-
+# ── Endpoint /v2/ocr ──────────────────────────────────────────────────────────
 
 @app.post("/v2/ocr")
 async def ocr_cupom(imagem: UploadFile = File(...), qr_url: str = Form(default="")):
     """
-    OCR seguro e resiliente.
-    Ordem: Gemini → regex fallback → QR parsing → manual.
-    Nunca retorna erro que quebre o frontend.
+    Pipeline OCR: QR params → Gemini 1.5-flash → Regex local.
+    Sempre retorna status:success — campos null ficam editáveis no frontend.
     """
     # Ler imagem
     try:
-        imagem_bytes = await imagem.read()
-        mime_type    = imagem.content_type or "image/jpeg"
-        if not mime_type.startswith("image/"):
+        raw       = await imagem.read()
+        mime      = imagem.content_type or "image/jpeg"
+        if not mime.startswith("image/"):
             return {"status": "error", "message": "Arquivo deve ser uma imagem"}
-        if len(imagem_bytes) > 10 * 1024 * 1024:
+        if len(raw) > 10 * 1024 * 1024:
             return {"status": "error", "message": "Imagem muito grande (máx 10MB)"}
-        imagem_b64 = base64.b64encode(imagem_bytes).decode("utf-8")
+        b64 = base64.b64encode(raw).decode()
     except Exception as e:
-        return {"status": "error", "message": f"Erro ao ler imagem: {str(e)}"}
+        return {"status": "error", "message": f"Erro ao ler imagem: {e}"}
 
-    # ── 1. Tentar Gemini ──────────────────────────────────────────────────────
-    dados_gemini = {}
+    fontes_coletadas: list[tuple[str, dict]] = []
     texto_gemini = ""
 
-    if GEMINI_API_KEY:
-        try:
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"inline_data": {"mime_type": mime_type, "data": imagem_b64}},
-                        {"text": PROMPT_OCR}
-                    ]
-                }],
-                "generationConfig": {
-                    "temperature":      0,
-                    "responseMimeType": "application/json",
-                }
-            }
+    # 1. QR params (instantâneo)
+    if qr_url:
+        dados_qr = _qr_extrair(qr_url)
+        if any(v is not None for v in dados_qr.values()):
+            fontes_coletadas.append(("qr", dados_qr))
 
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                    json=payload,
-                    headers={"Content-Type": "application/json"}
-                )
+    # Verificar o que ainda falta
+    parcial, _ = _mesclar(fontes_coletadas)
+    faltam = [c for c in parcial if parcial[c] is None]
 
-            if resp.is_success:
-                resp_json   = resp.json()
-                texto_gemini = resp_json.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    # 2. Gemini (só se faltar campo)
+    if faltam:
+        gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        dados_gem, texto_gemini = await _gemini_ocr(b64, mime, gemini_key)
+        if any(v is not None for v in dados_gem.values()):
+            fontes_coletadas.append(("gemini", dados_gem))
+        parcial, _ = _mesclar(fontes_coletadas)
+        faltam = [c for c in parcial if parcial[c] is None]
 
-                # Tentar parse JSON
-                try:
-                    raw = texto_gemini.strip()
-                    # Remover markdown se presente
-                    raw = re.sub(r'```json\s*|\s*```', '', raw).strip()
-                    parsed = json.loads(raw)
-                    # Validar e normalizar valor
-                    v = parsed.get("valor_total")
-                    if isinstance(v, str):
-                        v = float(v.replace(",", ".").replace("R$", "").strip())
-                    if v is not None and not (0.01 < float(v) < 100000):
-                        v = None
-                    dados_gemini = {
-                        "estabelecimento": parsed.get("estabelecimento") or None,
-                        "valor_total":     round(float(v), 2) if v else None,
-                        "data":            parsed.get("data") if re.match(r"\d{4}-\d{2}-\d{2}", str(parsed.get("data") or "")) else None,
-                    }
-                    print(f"[OCR] Gemini OK: {dados_gemini}")
-                except Exception as pe:
-                    print(f"[OCR] Gemini parse error: {pe} | texto: {texto_gemini[:100]}")
-            else:
-                print(f"[OCR] Gemini HTTP {resp.status_code}")
+    # 3. Regex (sempre roda se ainda faltar algo)
+    if faltam:
+        dados_rx = _regex_extrair(texto_gemini)
+        if any(v is not None for v in dados_rx.values()):
+            fontes_coletadas.append(("regex", dados_rx))
 
-        except httpx.TimeoutException:
-            print("[OCR] Gemini timeout (10s)")
-        except Exception as e:
-            print(f"[OCR] Gemini erro: {e}")
-    else:
-        print("[OCR] GEMINI_API_KEY não configurada — usando fallbacks")
+    # Mesclar tudo
+    final, fontes_usadas = _mesclar(fontes_coletadas)
+    categoria = _sugerir_cat(final.get("estabelecimento") or "")
 
-    # ── 2. Regex fallback (sempre roda, independente do Gemini) ──────────────
-    # Usa texto do Gemini se disponível, senão texto vazio (regex ainda pode pegar algo da resposta)
-    dados_regex = _ocr_regex_fallback(texto_gemini)
-    print(f"[OCR] Regex: {dados_regex}")
+    confs = {"qr": 0.8, "gemini": 1.0, "regex": 0.4}
+    conf  = max((confs.get(f, 0) for f in fontes_usadas), default=0.0)
+    fonte_principal = fontes_usadas[0] if fontes_usadas else "manual"
 
-    # ── 3. QR URL parsing (se URL foi enviada) ────────────────────────────────
-    dados_qr = {}
-    if qr_url and qr_url.startswith("http"):
-        dados_qr = _ocr_parse_qr_url(qr_url)
-        print(f"[OCR] QR params: {dados_qr}")
+    print(f"[OCR] fontes={fontes_usadas} | {final}")
 
-    # ── 4. Mesclar com prioridade: gemini > regex > qr ────────────────────────
-    dados_final, fonte = _mesclar_dados(dados_gemini, dados_regex, dados_qr)
-    categoria = _sugerir_cat_ocr(dados_final.get("estabelecimento") or "")
-
-    print(f"[OCR] Final: {dados_final} | fonte: {fonte}")
-
-    # Sempre retorna success — frontend decide o que fazer com dados null
     return {
         "status": "success",
         "data": {
-            "estabelecimento": dados_final["estabelecimento"],
-            "valor_total":     dados_final["valor_total"],
-            "data":            dados_final["data"],
+            "estabelecimento": final["estabelecimento"],
+            "valor_total":     final["valor_total"],
+            "data":            final["data"],
             "categoria":       categoria,
-            "fonte":           fonte,
-            "confianca":       1.0 if fonte == "gemini" else (0.6 if fonte == "regex" else 0.4),
+            "fonte":           fonte_principal,
+            "fontes":          fontes_usadas,
+            "confianca":       conf,
         }
     }
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
