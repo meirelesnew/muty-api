@@ -930,6 +930,21 @@ async def ocr_cupom(imagem: UploadFile = File(...), qr_url: str = Form(default="
 # V2 — DIAGNÓSTICO DE EMAIL + ESQUECI A SENHA
 # ══════════════════════════════════════════════════════════════════════════════
 
+@app.get("/v2/debug-ocr")
+async def debug_ocr():
+    """Verifica todas as variáveis necessárias para o OCR."""
+    gemini = os.environ.get("GEMINI_API_KEY", "")
+    return {
+        "status": "ok",
+        "gemini_configurado": bool(gemini),
+        "gemini_preview":     (gemini[:8] + "..." + gemini[-4:]) if gemini else "NÃO CONFIGURADA",
+        "solucao": None if gemini else (
+            "Acesse dashboard.render.com → muty-api → Environment → "
+            "Add Variable: GEMINI_API_KEY = sua-chave"
+        )
+    }
+
+
 @app.get("/v2/debug-email")
 async def debug_email():
     """
