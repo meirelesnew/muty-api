@@ -10,6 +10,7 @@ import httpx
 import traceback
 import secrets
 import base64
+import json
 from datetime import datetime, timedelta
 
 import resend
@@ -667,39 +668,31 @@ def _extrair_json_texto(texto: str) -> dict:
     """
     # Tentativa 1: JSON direto
     try:
-        return {"ok": True, "dados": json_parse(texto.strip())}
+        return {"ok": True, "dados": json.loads(texto.strip())}
     except Exception:
         pass
 
     # Tentativa 2: extrair bloco JSON do texto
-    import re as _re
-    m = _re.search(r'\{[\s\S]*?\}', texto)
+    m = re.search(r'\{[\s\S]*?\}', texto)
     if m:
         try:
-            return {"ok": True, "dados": json_parse(m.group(0))}
+            return {"ok": True, "dados": json.loads(m.group(0))}
         except Exception:
             pass
 
     # Tentativa 3: regex para valor e data
     dados = {"estabelecimento": None, "valor_total": None, "data": None, "confianca": 0.2}
-    # Valor
-    vm = _re.search(r'(?:TOTAL|VALOR TOTAL|TOTAL A PAGAR|VL TOTAL)[^\d]*([\d]{1,6}[,.]\d{2})', texto, _re.IGNORECASE)
+    vm = re.search(r'(?:TOTAL|VALOR TOTAL|TOTAL A PAGAR|VL TOTAL)[^\d]*([\d]{1,6}[,.]\d{2})', texto, re.IGNORECASE)
     if vm:
         try:
             dados["valor_total"] = float(vm.group(1).replace(",", "."))
         except Exception:
             pass
-    # Data
-    dm = _re.search(r'(\d{2})/(\d{2})/(\d{4})', texto)
+    dm = re.search(r'(\d{2})/(\d{2})/(\d{4})', texto)
     if dm:
         dados["data"] = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}"
 
     return {"ok": False, "dados": dados, "fonte": "regex"}
-
-def json_parse(texto: str) -> dict:
-    """Parse JSON com import interno para evitar conflito de nomes."""
-    import json
-    return json.loads(texto)
 
 @app.post("/v2/ocr")
 async def ocr_cupom(imagem: UploadFile = File(...)):
