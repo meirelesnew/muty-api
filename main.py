@@ -752,7 +752,8 @@ async def _gemini_ocr(b64: str, mime: str, key: str) -> tuple[dict, str]:
                 "responseMimeType": "application/json",
             }
         }
-        async with httpx.AsyncClient(timeout=10) as cli:
+        print(f"[GEMINI] enviando {len(b64)//1024}KB b64 para Gemini...")
+        async with httpx.AsyncClient(timeout=30) as cli:
             resp = await cli.post(
                 f"{GEMINI_OCR_URL}?key={key}",
                 json=payload,
