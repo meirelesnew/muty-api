@@ -774,7 +774,7 @@ def _extrair_valor(html: str) -> float:
     """
     # Padrão 1: atributos data-* usados por portais modernos
     # ex: data-valor="125.90" ou data-total="125.90"
-    m = re.search(r'data-(?:valor|total|preco)["']?\s*[=:]\s*["']?([\d]+[.,][\d]{2})', html, re.IGNORECASE)
+    m = re.search(r'data-(?:valor|total|preco)[^\s=]*\s*[=:]\s*[\"\']?([\d]+[.,][\d]{2})', html, re.IGNORECASE)
     if m:
         try:
             v = float(m.group(1).replace(",", "."))
