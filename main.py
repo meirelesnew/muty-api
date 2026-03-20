@@ -742,9 +742,17 @@ async def reset_password(request: Request):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _HEADERS_NF = {
-    "User-Agent":      "Mozilla/5.0 (Android 13; Mobile) AppleWebKit/537.36 Chrome/120",
-    "Accept":          "text/html,application/xhtml+xml",
-    "Accept-Language": "pt-BR,pt;q=0.9",
+    "User-Agent":      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control":   "max-age=0",
+    "Sec-Fetch-Dest":  "document",
+    "Sec-Fetch-Mode":  "navigate",
+    "Sec-Fetch-Site":  "none",
+    "Sec-Fetch-User":  "?1",
 }
 _ESTADOS_NF = {
     "nfce.fazenda.sp.gov.br": "SP",
@@ -877,17 +885,63 @@ async def processar_nota_fiscal(request: Request):
 
         estado = _detectar_estado(url)
 
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            try:
-                resp = await client.get(url, headers=_HEADERS_NF)
-                resp.raise_for_status()
-                html = resp.text
-            except httpx.TimeoutException:
-                return {"status": "error", "message": "Tempo esgotado ao acessar a nota"}
-            except httpx.HTTPStatusError as e:
-                return {"status": "error", "message": f"Nota não encontrada (HTTP {e.response.status_code})"}
-            except Exception as e:
-                return {"status": "error", "message": f"Erro ao acessar nota: {str(e)}"}
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            html = None
+            ultimo_erro = ""
+
+            # Tentar com 2 User-Agents diferentes (alguns portais bloqueiam mobile)
+            user_agents = [
+                _HEADERS_NF["User-Agent"],
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ]
+
+            for ua in user_agents:
+                try:
+                    headers = {**_HEADERS_NF, "User-Agent": ua}
+                    resp = await client.get(url, headers=headers)
+
+                    # Verificar se foi bloqueado
+                    if resp.status_code in [403, 429, 503]:
+                        ultimo_erro = f"Bloqueado (HTTP {resp.status_code})"
+                        continue
+
+                    resp.raise_for_status()
+                    html = resp.text
+
+                    # Verificar se o HTML tem conteúdo útil
+                    if len(html) < 500:
+                        ultimo_erro = "HTML muito curto — possível bloqueio"
+                        html = None
+                        continue
+
+                    # Verificar se foi bloqueado via conteúdo
+                    termos_bloqueio = ["acesso bloqueado", "acesso negado", "access denied",
+                                       "403 forbidden", "blocked", "captcha", "bot detection"]
+                    if any(t in html.lower() for t in termos_bloqueio):
+                        ultimo_erro = "Portal retornou página de bloqueio"
+                        html = None
+                        continue
+
+                    break  # HTML válido encontrado
+
+                except httpx.TimeoutException:
+                    ultimo_erro = "Timeout"
+                    continue
+                except httpx.HTTPStatusError as e:
+                    ultimo_erro = f"HTTP {e.response.status_code}"
+                    continue
+                except Exception as e:
+                    ultimo_erro = str(e)
+                    continue
+
+            if html is None:
+                return {
+                    "status": "error",
+                    "message": f"Portal da SEFAZ bloqueou o acesso automático ({ultimo_erro}). "
+                               f"Use o modo manual ou tire foto do cupom.",
+                    "code": "sefaz_blocked"
+                }
 
         estabelecimento = _extrair_estabelecimento(html)
         return {
