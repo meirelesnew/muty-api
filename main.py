@@ -864,12 +864,15 @@ async def ocr_cupom(imagem: UploadFile = File(...), qr_url: str = Form(default="
     """
     # Ler imagem
     try:
-        raw       = await imagem.read()
-        mime      = imagem.content_type or "image/jpeg"
+        raw  = await imagem.read()
+        mime = imagem.content_type or "image/jpeg"
+        print(f"[OCR] imagem: {len(raw)} bytes | mime: {mime} | qr_url: {bool(qr_url)}")
         if not mime.startswith("image/"):
             return {"status": "error", "message": "Arquivo deve ser uma imagem"}
         if len(raw) > 10 * 1024 * 1024:
             return {"status": "error", "message": "Imagem muito grande (máx 10MB)"}
+        if len(raw) < 100:
+            print("[OCR] AVISO: imagem muito pequena — pode ser arquivo vazio")
         b64 = base64.b64encode(raw).decode()
     except Exception as e:
         return {"status": "error", "message": f"Erro ao ler imagem: {e}"}
@@ -883,24 +886,23 @@ async def ocr_cupom(imagem: UploadFile = File(...), qr_url: str = Form(default="
         if any(v is not None for v in dados_qr.values()):
             fontes_coletadas.append(("qr", dados_qr))
 
-    # Verificar o que ainda falta
-    parcial, _ = _mesclar(fontes_coletadas)
-    faltam = [c for c in parcial if parcial[c] is None]
+    # 2. Gemini — sempre tenta se tiver chave (não depende de faltam)
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    print(f"[OCR] gemini_key presente: {bool(gemini_key)}")
 
-    # 2. Gemini (só se faltar campo)
-    if faltam:
-        gemini_key = os.environ.get("GEMINI_API_KEY", "")
-        dados_gem, texto_gemini = await _gemini_ocr(b64, mime, gemini_key)
-        if any(v is not None for v in dados_gem.values()):
-            fontes_coletadas.append(("gemini", dados_gem))
-        parcial, _ = _mesclar(fontes_coletadas)
-        faltam = [c for c in parcial if parcial[c] is None]
+    dados_gem, texto_gemini = await _gemini_ocr(b64, mime, gemini_key)
+    print(f"[OCR] gemini retornou: {dados_gem} | texto_len: {len(texto_gemini)}")
 
-    # 3. Regex (sempre roda se ainda faltar algo)
-    if faltam:
-        dados_rx = _regex_extrair(texto_gemini)
-        if any(v is not None for v in dados_rx.values()):
-            fontes_coletadas.append(("regex", dados_rx))
+    # Adicionar gemini se retornou qualquer campo
+    if any(v is not None for v in dados_gem.values()):
+        fontes_coletadas.append(("gemini", dados_gem))
+
+    # 3. Regex — sempre roda usando o texto do Gemini (mesmo se todos null)
+    #    Isso garante que mesmo sem Gemini útil, o regex tenta extrair do texto
+    dados_rx = _regex_extrair(texto_gemini)
+    print(f"[OCR] regex retornou: {dados_rx}")
+    if any(v is not None for v in dados_rx.values()):
+        fontes_coletadas.append(("regex", dados_rx))
 
     # Mesclar tudo
     final, fontes_usadas = _mesclar(fontes_coletadas)
@@ -910,7 +912,7 @@ async def ocr_cupom(imagem: UploadFile = File(...), qr_url: str = Form(default="
     conf  = max((confs.get(f, 0) for f in fontes_usadas), default=0.0)
     fonte_principal = fontes_usadas[0] if fontes_usadas else "manual"
 
-    print(f"[OCR] fontes={fontes_usadas} | {final}")
+    print(f"[OCR] FINAL: fontes={fontes_usadas} | {final}")
 
     return {
         "status": "success",
