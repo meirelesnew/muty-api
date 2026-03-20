@@ -732,13 +732,20 @@ def _qr_extrair(url: str) -> dict:
 
 async def _gemini_ocr(b64: str, mime: str, key: str) -> tuple[dict, str]:
     """
-    Gemini 1.5-flash, temp=0, timeout=10s.
-    Retorna (dados, texto_bruto) — texto_bruto alimenta o regex fallback.
+    Gemini 1.5-flash, temp=0, timeout=30s.
+    Envia payload como bytes (evita serialização JSON de imagens grandes).
+    Retorna (dados, texto_bruto).
     """
     vazio = {"estabelecimento": None, "valor_total": None, "data": None}
+    texto = ""
+
     if not key:
-        print("[GEMINI] sem chave")
+        print("[GEMINI] sem chave — pulando")
         return vazio, ""
+
+    b64_kb = len(b64) // 1024
+    print(f"[GEMINI] iniciando | imagem: {b64_kb}KB b64 | mime: {mime}")
+
     try:
         payload = {
             "contents": [{
@@ -752,23 +759,38 @@ async def _gemini_ocr(b64: str, mime: str, key: str) -> tuple[dict, str]:
                 "responseMimeType": "application/json",
             }
         }
-        print(f"[GEMINI] enviando {len(b64)//1024}KB b64 para Gemini...")
-        async with httpx.AsyncClient(timeout=30) as cli:
+
+        # Serializar manualmente para bytes — evita problema com payloads grandes
+        import json as _json
+        payload_bytes = _json.dumps(payload).encode("utf-8")
+        print(f"[GEMINI] payload serializado: {len(payload_bytes)//1024}KB")
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as cli:
             resp = await cli.post(
                 f"{GEMINI_OCR_URL}?key={key}",
-                json=payload,
+                content=payload_bytes,
                 headers={"Content-Type": "application/json"}
             )
 
+        print(f"[GEMINI] HTTP {resp.status_code}")
+
         if not resp.is_success:
-            print(f"[GEMINI] HTTP {resp.status_code}")
+            body_preview = resp.text[:200]
+            print(f"[GEMINI] erro body: {body_preview}")
             return vazio, ""
 
-        texto = (resp.json()
+        resp_json = resp.json()
+        texto = (resp_json
                  .get("candidates", [{}])[0]
                  .get("content", {})
                  .get("parts", [{}])[0]
                  .get("text", ""))
+
+        print(f"[GEMINI] texto recebido: {len(texto)} chars | preview: {texto[:80]}")
+
+        if not texto:
+            print("[GEMINI] texto vazio — Gemini não retornou nada")
+            return vazio, ""
 
         # Parse JSON — limpar markdown se presente
         clean = _re.sub(r"```json\s*|\s*```", "", texto).strip()
@@ -783,14 +805,16 @@ async def _gemini_ocr(b64: str, mime: str, key: str) -> tuple[dict, str]:
         return dados, texto
 
     except httpx.TimeoutException:
-        print("[GEMINI] timeout 10s")
-        return vazio, ""
+        print(f"[GEMINI] TIMEOUT após 30s | b64={b64_kb}KB")
+        return vazio, texto
     except json.JSONDecodeError as je:
-        print(f"[GEMINI] JSON inválido: {je} | texto[:80]={texto[:80]}")
-        return vazio, texto   # retorna texto bruto para regex
+        print(f"[GEMINI] JSON inválido: {je} | texto: {texto[:100]}")
+        return vazio, texto
     except Exception as e:
-        print(f"[GEMINI] erro: {e}")
-        return vazio, ""
+        print(f"[GEMINI] ERRO inesperado: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return vazio, texto
 
 # ── Fonte 3: Regex ────────────────────────────────────────────────────────────
 
