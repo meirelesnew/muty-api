@@ -112,7 +112,7 @@ def _enviar_email(para: str, assunto: str, html: str) -> tuple[bool, str]:
     try:
         resend.api_key = RESEND_API_KEY
         params: resend.Emails.SendParams = {
-            "from":    "MUTY Transporte <onboarding@resend.dev>",
+            "from":    "MUTY Transporte <noreply@untanjon.resend.app>",
             "to":      [para],
             "subject": assunto,
             "html":    html,
