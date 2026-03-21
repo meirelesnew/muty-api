@@ -1066,16 +1066,23 @@ async def ocr_cupom(imagem: UploadFile = File(...), qr_url: str = Form(default="
 
 @app.get("/v2/debug-ocr")
 async def debug_ocr():
-    """Verifica todas as variáveis necessárias para o OCR."""
-    gemini = os.environ.get("GEMINI_API_KEY", "")
+    """Verifica todas as chaves Gemini configuradas."""
+    k0 = os.environ.get("GEMINI_API_KEY",   "")
+    k1 = os.environ.get("GEMINI_API_KEY_1", "")
+    k2 = os.environ.get("GEMINI_API_KEY_2", "")
+
+    def preview(k):
+        if not k: return "NAO_CONFIGURADA"
+        return k[:8] + "..." + k[-4:]
+
+    chaves = [k for k in [k0, k1, k2] if k]
     return {
-        "status": "ok",
-        "gemini_configurado": bool(gemini),
-        "gemini_preview":     (gemini[:8] + "..." + gemini[-4:]) if gemini else "NÃO CONFIGURADA",
-        "solucao": None if gemini else (
-            "Acesse dashboard.render.com → muty-api → Environment → "
-            "Add Variable: GEMINI_API_KEY = sua-chave"
-        )
+        "status":             "ok",
+        "total_chaves":       len(chaves),
+        "GEMINI_API_KEY":     preview(k0),
+        "GEMINI_API_KEY_1":   preview(k1),
+        "GEMINI_API_KEY_2":   preview(k2),
+        "aviso": None if chaves else "Nenhuma chave configurada!"
     }
 
 
