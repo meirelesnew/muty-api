@@ -104,34 +104,40 @@ def _html_email(titulo: str, nome: str, mensagem: str, link: str, btn_texto: str
 
 def enviar_email(destino, assunto, mensagem):
     """
-    Envia email via Gmail SMTP 587/STARTTLS.
-    Usa GMAIL_USER e GMAIL_SENHA_APP do ambiente Render.
+    Envia email via Resend API (HTTPS porta 443).
+    Funciona no Render gratuito — não usa SMTP.
     Retorna True se enviou, False se falhou.
     """
+    import httpx as _httpx
+
+    api_key = os.environ.get("RESEND_API_KEY", "")
+    if not api_key:
+        print("[EMAIL] RESEND_API_KEY nao configurada")
+        return False
+
     try:
-        email = os.environ.get("GMAIL_USER", "")
-        senha = os.environ.get("GMAIL_SENHA_APP", "")
+        resp = _httpx.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "from":    "MUTY Transporte <onboarding@resend.dev>",
+                "to":      [destino],
+                "subject": assunto,
+                "html":    mensagem,
+            },
+            timeout=15,
+        )
 
-        if not email or not senha:
-            print("[EMAIL] GMAIL_USER ou GMAIL_SENHA_APP nao configurados")
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            print(f"[EMAIL] OK — id={data.get('id','?')} para {destino}")
+            return True
+        else:
+            print(f"[EMAIL ERRO]: HTTP {resp.status_code} | {resp.text[:200]}")
             return False
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = assunto
-        msg["From"]    = f"MUTY Transporte <{email}>"
-        msg["To"]      = destino
-        msg.attach(MIMEText(mensagem, "html", "utf-8"))
-
-        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(email, senha)
-        server.sendmail(email, destino, msg.as_string())
-        server.quit()
-
-        print(f"[EMAIL] OK — enviado para {destino}")
-        return True
 
     except Exception as e:
         print("[EMAIL ERRO REAL]:", repr(e))
