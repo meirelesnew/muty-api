@@ -827,8 +827,15 @@ async def _gemini_ocr(b64: str, mime: str, key: str) -> tuple[dict, str]:
     raw_bytes, mime = _comprimir_imagem(raw_bytes, mime)
     b64 = base64.b64encode(raw_bytes).decode("utf-8")
 
+    # Rotação de chaves — tenta extras se principal estiver com 429
+    chaves_extras = [
+        os.environ.get("GEMINI_API_KEY_1", ""),
+        os.environ.get("GEMINI_API_KEY_2", ""),
+    ]
+    chaves_disponiveis = [key] + [k for k in chaves_extras if k]
+
     b64_kb = len(b64) // 1024
-    print(f"[GEMINI] iniciando | imagem: {b64_kb}KB b64 | mime: {mime}")
+    print(f"[GEMINI] iniciando | imagem: {b64_kb}KB b64 | mime: {mime} | chaves: {len(chaves_disponiveis)}")
 
     try:
         payload = {
@@ -849,14 +856,26 @@ async def _gemini_ocr(b64: str, mime: str, key: str) -> tuple[dict, str]:
         payload_bytes = _json.dumps(payload).encode("utf-8")
         print(f"[GEMINI] payload serializado: {len(payload_bytes)//1024}KB")
 
+        resp = None
+        chave_usada = None
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as cli:
-            resp = await cli.post(
-                f"{GEMINI_OCR_URL}?key={key}",
-                content=payload_bytes,
-                headers={"Content-Type": "application/json"}
-            )
+            for idx_chave, chave_atual in enumerate(chaves_disponiveis):
+                resp = await cli.post(
+                    f"{GEMINI_OCR_URL}?key={chave_atual}",
+                    content=payload_bytes,
+                    headers={"Content-Type": "application/json"}
+                )
+                if resp.status_code == 429:
+                    print(f"[GEMINI] chave {idx_chave+1} com 429 — tentando próxima")
+                    continue
+                chave_usada = idx_chave + 1
+                break
 
-        print(f"[GEMINI] HTTP {resp.status_code}")
+        if resp is None or resp.status_code == 429:
+            print(f"[GEMINI] todas as {len(chaves_disponiveis)} chave(s) com 429")
+            return vazio, ""
+
+        print(f"[GEMINI] HTTP {resp.status_code} | chave {chave_usada}")
 
         if not resp.is_success:
             body_preview = resp.text[:200]
@@ -996,10 +1015,14 @@ async def ocr_cupom(imagem: UploadFile = File(...), qr_url: str = Form(default="
             fontes_coletadas.append(("qr", dados_qr))
 
     # 2. Gemini — sempre tenta se tiver chave (não depende de faltam)
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    print(f"[OCR] gemini_key presente: {bool(gemini_key)}")
+    # Coletar todas as chaves disponíveis para rotação automática
+    gemini_key = os.environ.get("GEMINI_API_KEY",   "")
+    gemini_k2  = os.environ.get("GEMINI_API_KEY_2", "")
+    gemini_k3  = os.environ.get("GEMINI_API_KEY_3", "")
+    chaves_gemini = [k for k in [gemini_key, gemini_k2, gemini_k3] if k]
+    print(f"[OCR] chaves Gemini disponíveis: {len(chaves_gemini)}")
 
-    dados_gem, texto_gemini = await _gemini_ocr(b64, mime, gemini_key)
+    dados_gem, texto_gemini = await _gemini_ocr(b64, mime, chaves_gemini[0] if chaves_gemini else "")
     print(f"[OCR] gemini retornou: {dados_gem} | texto_len: {len(texto_gemini)}")
 
     # Adicionar gemini se retornou qualquer campo
