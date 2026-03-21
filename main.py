@@ -17,7 +17,6 @@ import io
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-import resend
 from email_validator import validate_email, EmailNotValidError
 
 from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Form
@@ -31,7 +30,6 @@ import jwt as pyjwt   # PyJWT — mais estável com Python 3.14
 import bcrypt         # bcrypt direto — sem passlib (evita bug 72 bytes)
 
 SECRET_KEY      = os.environ.get("JWT_SECRET",    "muty-secret-dev-2026-TROCAR-em-producao")
-RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")   # NUNCA expor no frontend
 FRONTEND_URL    = os.environ.get("FRONTEND_URL",   "https://meirelesnew.github.io/muty-transporte-2026")
 GMAIL_USER      = os.environ.get("GMAIL_USER",      "")
@@ -40,7 +38,6 @@ ALGORITHM       = "HS256"
 TOKEN_HOURS     = 8
 VERIFY_HOURS    = 24  # token de verificação de email expira em 24h
 
-resend.api_key = RESEND_API_KEY
 
 bearer_ = HTTPBearer(auto_error=False)
 
@@ -104,52 +101,52 @@ def _html_email(titulo: str, nome: str, mensagem: str, link: str, btn_texto: str
     </div>
     """
 
+def enviar_email(destino: str, assunto: str, mensagem: str) -> bool:
+    """
+    Envia email via Gmail SMTP (porta 587 + STARTTLS).
+    Usa GMAIL_USER e GMAIL_SENHA_APP do ambiente.
+    Retorna True se enviou, False se falhou.
+    """
+    usuario = os.environ.get("GMAIL_USER", "")
+    senha   = os.environ.get("GMAIL_SENHA_APP", "")
+
+    if not usuario or not senha:
+        print("[EMAIL] GMAIL_USER ou GMAIL_SENHA_APP não configurados no Render")
+        return False
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = assunto
+        msg["From"]    = f"MUTY Transporte <{usuario}>"
+        msg["To"]      = destino
+        msg.attach(MIMEText(mensagem, "html", "utf-8"))
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            smtp.login(usuario, senha)
+            smtp.sendmail(usuario, destino, msg.as_string())
+
+        print(f"[EMAIL] Enviado para {destino}")
+        return True
+
+    except smtplib.SMTPAuthenticationError:
+        print("[EMAIL] ERRO: autenticacao Gmail falhou — verifique GMAIL_SENHA_APP")
+        return False
+    except smtplib.SMTPException as e:
+        print(f"[EMAIL] ERRO SMTP: {e}")
+        return False
+    except Exception as e:
+        print(f"[EMAIL] ERRO inesperado: {e}")
+        return False
+
+
+# Alias para compatibilidade interna
 def _enviar_email(para: str, assunto: str, html: str) -> tuple[bool, str]:
-    """
-    Envia email via Gmail SMTP (primário) ou Resend (fallback).
-    Retorna (True, "") se ok ou (False, erro) se falhou.
-    """
-    # ── Tentar Gmail SMTP primeiro ────────────────────────────────────────────
-    if GMAIL_USER and GMAIL_SENHA_APP:
-        try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = assunto
-            msg["From"]    = f"MUTY Transporte <{GMAIL_USER}>"
-            msg["To"]      = para
-            msg.attach(MIMEText(html, "html", "utf-8"))
+    ok = enviar_email(para, assunto, html)
+    return ok, ("" if ok else "Falha ao enviar email")
 
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-                smtp.login(GMAIL_USER, GMAIL_SENHA_APP)
-                smtp.sendmail(GMAIL_USER, para, msg.as_string())
-
-            print(f"[EMAIL-GMAIL] Enviado para {para}")
-            return True, ""
-        except Exception as e:
-            erro = str(e)
-            print(f"[EMAIL-GMAIL] ERRO: {erro} — tentando Resend")
-
-    # ── Fallback: Resend ──────────────────────────────────────────────────────
-    if RESEND_API_KEY:
-        try:
-            resend.api_key = RESEND_API_KEY
-            params: resend.Emails.SendParams = {
-                "from":    "MUTY Transporte <onboarding@resend.dev>",
-                "to":      [para],
-                "subject": assunto,
-                "html":    html,
-            }
-            resultado = resend.Emails.send(params)
-            id_email = resultado.get("id", "?") if isinstance(resultado, dict) else str(resultado)
-            print(f"[EMAIL-RESEND] Enviado para {para} | id={id_email}")
-            return True, ""
-        except Exception as e:
-            erro = str(e)
-            print(f"[EMAIL-RESEND] ERRO: {erro}")
-            traceback.print_exc()
-            return False, erro
-
-    print(f"[EMAIL-DEV] Nenhum provedor configurado | Para: {para}")
-    return False, "Nenhum provedor de email configurado"
 
 def enviar_email_verificacao(email: str, nome: str, token: str) -> bool:
     link = f"https://muty-api.onrender.com/v2/verify-email?token={token}"
@@ -1113,43 +1110,32 @@ async def debug_ocr():
 
 @app.get("/v2/debug-email")
 async def debug_email():
-    """Diagnóstico do Resend — verifica configuração e tenta envio de teste."""
-    chave = RESEND_API_KEY
-    if not chave:
-        return {
-            "status": "error",
-            "message": "RESEND_API_KEY não configurada",
-            "solucao": "Render → muty-api → Environment → RESEND_API_KEY"
-        }
+    """Diagnóstico do Gmail SMTP."""
+    usuario = os.environ.get("GMAIL_USER", "")
+    senha   = os.environ.get("GMAIL_SENHA_APP", "")
     return {
-        "status":            "ok",
-        "resend_configurado": True,
-        "chave_preview":      chave[:8] + "..." + chave[-4:],
-        "frontend_url":       FRONTEND_URL,
-        "aviso":              "onboarding@resend.dev so entrega para o email verificado na conta Resend. Para outros emails configure um dominio proprio no Resend.",
+        "status":           "ok",
+        "gmail_user":       usuario[:20] + "..." if usuario else "NAO_CONFIGURADO",
+        "gmail_senha_app":  "configurada" if senha else "NAO_CONFIGURADA",
+        "provedor":         "Gmail SMTP 587/STARTTLS",
     }
+
 
 
 @app.post("/v2/test-email")
 async def test_email(request: Request):
-    """Envia email de teste para diagnosticar o Resend."""
+    """Envia email de teste via Gmail SMTP."""
     try:
-        body  = await request.json()
-        para  = str(body.get("email", "")).strip()
+        body = await request.json()
+        para = str(body.get("email", "")).strip()
         if not para:
             return {"status": "error", "message": "Email obrigatório"}
-
-        ok, erro = _enviar_email(
-            para    = para,
-            assunto = "Teste MUTY — email funcionando",
-            html    = "<h2>Teste MUTY</h2><p>Se você recebeu este email, o Resend está funcionando!</p>"
+        ok = enviar_email(
+            destino  = para,
+            assunto  = "Teste MUTY — Gmail funcionando",
+            mensagem = "<h2>MUTY Transporte</h2><p>Email de teste enviado com sucesso via Gmail SMTP!</p>"
         )
-        return {
-            "status":  "success" if ok else "error",
-            "enviado": ok,
-            "erro":    erro or None,
-            "para":    para,
-        }
+        return {"status": "success" if ok else "error", "enviado": ok, "para": para}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
