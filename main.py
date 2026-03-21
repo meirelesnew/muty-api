@@ -460,6 +460,51 @@ async def me(user=Depends(get_current_user)):
     return {"status": "success", "data": user_doc}
 
 
+@app.put("/v2/me")
+async def atualizar_perfil(request: Request, user=Depends(get_current_user)):
+    """Atualiza perfil do usuário: nickname, foto, telefone, empresa, nome."""
+    try:
+        body = await request.json()
+        db   = get_db()
+
+        campos_permitidos = {"nickname", "foto_url", "telefone", "empresa", "nome"}
+        update = {}
+        for campo in campos_permitidos:
+            if campo in body and body[campo] is not None:
+                valor = str(body[campo]).strip()
+                if campo == "foto_url" and len(valor) > 500:
+                    return {"status": "error", "message": "URL da foto muito longa"}
+                if campo == "telefone":
+                    valor = re.sub(r"[^\d\+\(\)\-\s]", "", valor)[:20]
+                if campo == "nickname":
+                    valor = valor[:30]
+                if campo == "nome":
+                    valor = valor[:80]
+                if campo == "empresa":
+                    valor = valor[:80]
+                update[campo] = valor
+
+        if not update:
+            return {"status": "error", "message": "Nenhum campo para atualizar"}
+
+        update["updated_at"] = datetime.utcnow()
+        db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": update}
+        )
+
+        user_doc = db.users.find_one(
+            {"user_id": user["user_id"]},
+            {"_id": 0, "senha_hash": 0}
+        )
+        print(f"[PERFIL] Atualizado: {user['email']} | campos: {list(update.keys())}")
+        return {"status": "success", "data": user_doc}
+
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Erro: {str(e)}"}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # V2 — DADOS ISOLADOS POR USUÁRIO
 # ══════════════════════════════════════════════════════════════════════════════
