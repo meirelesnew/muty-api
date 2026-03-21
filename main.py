@@ -245,7 +245,7 @@ def _save_dados_v2(db, user_id: str, tipo: str, dados) -> bool:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "MUTY Transporte API", "versao": "2.2"}
+    return {"status": "ok", "app": "MUTY Transporte API", "versao": "2.2", "build": "20260321-0209"}
 
 @app.get("/health")
 def health():
