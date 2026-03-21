@@ -118,7 +118,8 @@ def _enviar_email(para: str, assunto: str, html: str) -> tuple[bool, str]:
             "html":    html,
         }
         resultado = resend.Emails.send(params)
-        print(f"[EMAIL] Enviado para {para} | id={resultado.get('id','?')}")
+        id_email = resultado.get('id', '?') if isinstance(resultado, dict) else str(resultado)
+        print(f"[EMAIL] Enviado para {para} | id={id_email}")
         return True, ""
     except Exception as e:
         erro = str(e)
@@ -473,7 +474,7 @@ async def atualizar_perfil(request: Request, user=Depends(get_current_user)):
         for campo in campos_permitidos:
             if campo in body and body[campo] is not None:
                 valor = str(body[campo]).strip()
-                if campo == "foto_url" and len(valor) > 500:
+                if campo == "foto_url" and len(valor) > 500000:
                     return {"status": "error", "message": "URL da foto muito longa"}
                 if campo == "telefone":
                     valor = re.sub(r"[^\d\+\(\)\-\s]", "", valor)[:20]
@@ -1088,23 +1089,45 @@ async def debug_ocr():
 
 @app.get("/v2/debug-email")
 async def debug_email():
-    """
-    Diagnóstico: verifica se RESEND_API_KEY está configurada.
-    Não envia email — apenas verifica a configuração.
-    """
+    """Diagnóstico do Resend — verifica configuração e tenta envio de teste."""
     chave = RESEND_API_KEY
     if not chave:
         return {
             "status": "error",
-            "message": "RESEND_API_KEY não configurada no Render",
-            "solucao": "Acesse dashboard.render.com > muty-api > Environment > Add Variable: RESEND_API_KEY = re_XXXXXXXX"
+            "message": "RESEND_API_KEY não configurada",
+            "solucao": "Render → muty-api → Environment → RESEND_API_KEY"
         }
     return {
-        "status": "ok",
+        "status":            "ok",
         "resend_configurado": True,
-        "chave_preview": chave[:8] + "..." + chave[-4:],  # mostra só parte da chave
-        "frontend_url": FRONTEND_URL,
+        "chave_preview":      chave[:8] + "..." + chave[-4:],
+        "frontend_url":       FRONTEND_URL,
+        "aviso":              "onboarding@resend.dev so entrega para o email verificado na conta Resend. Para outros emails configure um dominio proprio no Resend.",
     }
+
+
+@app.post("/v2/test-email")
+async def test_email(request: Request):
+    """Envia email de teste para diagnosticar o Resend."""
+    try:
+        body  = await request.json()
+        para  = str(body.get("email", "")).strip()
+        if not para:
+            return {"status": "error", "message": "Email obrigatório"}
+
+        ok, erro = _enviar_email(
+            para    = para,
+            assunto = "Teste MUTY — email funcionando",
+            html    = "<h2>Teste MUTY</h2><p>Se você recebeu este email, o Resend está funcionando!</p>"
+        )
+        return {
+            "status":  "success" if ok else "error",
+            "enviado": ok,
+            "erro":    erro or None,
+            "para":    para,
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @app.post("/v2/forgot-password")
