@@ -13,6 +13,7 @@ import base64
 import json
 from datetime import datetime, timedelta
 
+import io
 import resend
 from email_validator import validate_email, EmailNotValidError
 
@@ -775,6 +776,39 @@ def _qr_extrair(url: str) -> dict:
 
 # ── Fonte 2: Gemini ───────────────────────────────────────────────────────────
 
+
+def _comprimir_imagem(raw: bytes, mime: str, max_lado: int = 800, qualidade: int = 60) -> tuple[bytes, str]:
+    """
+    Comprime imagem para máx 800px e qualidade 60%.
+    Reduz de ~10MB para ~100KB — 100x menos tokens no Gemini.
+    Retorna (bytes_comprimidos, mime_type).
+    """
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+
+        # Converter para RGB se necessário (PNG com transparência, etc)
+        if img.mode not in ('RGB', 'L'):
+            img = img.convert('RGB')
+
+        # Redimensionar mantendo proporção
+        w, h = img.size
+        if w > max_lado or h > max_lado:
+            ratio = max_lado / max(w, h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+
+        # Salvar como JPEG comprimido
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=qualidade, optimize=True)
+        buf.seek(0)
+        resultado = buf.read()
+        print(f"[COMPRESS] {len(raw)//1024}KB → {len(resultado)//1024}KB ({img.size[0]}x{img.size[1]}px)")
+        return resultado, 'image/jpeg'
+
+    except Exception as e:
+        print(f"[COMPRESS] Erro ao comprimir: {e} — usando original")
+        return raw, mime
+
 async def _gemini_ocr(b64: str, mime: str, key: str) -> tuple[dict, str]:
     """
     Gemini 1.5-flash, temp=0, timeout=30s.
@@ -787,6 +821,11 @@ async def _gemini_ocr(b64: str, mime: str, key: str) -> tuple[dict, str]:
     if not key:
         print("[GEMINI] sem chave — pulando")
         return vazio, ""
+
+    # Comprimir imagem antes de enviar ao Gemini
+    raw_bytes = base64.b64decode(b64)
+    raw_bytes, mime = _comprimir_imagem(raw_bytes, mime)
+    b64 = base64.b64encode(raw_bytes).decode("utf-8")
 
     b64_kb = len(b64) // 1024
     print(f"[GEMINI] iniciando | imagem: {b64_kb}KB b64 | mime: {mime}")
