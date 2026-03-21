@@ -101,49 +101,45 @@ def _html_email(titulo: str, nome: str, mensagem: str, link: str, btn_texto: str
     </div>
     """
 
-def enviar_email(destino: str, assunto: str, mensagem: str) -> bool:
+
+def enviar_email(destino, assunto, mensagem):
     """
-    Envia email via Gmail SMTP (porta 587 + STARTTLS).
-    Usa GMAIL_USER e GMAIL_SENHA_APP do ambiente.
+    Envia email via Gmail SMTP 587/STARTTLS.
+    Usa GMAIL_USER e GMAIL_SENHA_APP do ambiente Render.
     Retorna True se enviou, False se falhou.
     """
-    usuario = os.environ.get("GMAIL_USER", "")
-    senha   = os.environ.get("GMAIL_SENHA_APP", "")
-
-    if not usuario or not senha:
-        print("[EMAIL] GMAIL_USER ou GMAIL_SENHA_APP não configurados no Render")
-        return False
-
     try:
+        email = os.environ.get("GMAIL_USER", "")
+        senha = os.environ.get("GMAIL_SENHA_APP", "")
+
+        if not email or not senha:
+            print("[EMAIL] GMAIL_USER ou GMAIL_SENHA_APP nao configurados")
+            return False
+
         msg = MIMEMultipart("alternative")
         msg["Subject"] = assunto
-        msg["From"]    = f"MUTY Transporte <{usuario}>"
+        msg["From"]    = f"MUTY Transporte <{email}>"
         msg["To"]      = destino
         msg.attach(MIMEText(mensagem, "html", "utf-8"))
 
-        with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
-            smtp.ehlo()
-            smtp.starttls()
-            smtp.ehlo()
-            smtp.login(usuario, senha)
-            smtp.sendmail(usuario, destino, msg.as_string())
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(email, senha)
+        server.sendmail(email, destino, msg.as_string())
+        server.quit()
 
-        print(f"[EMAIL] Enviado para {destino}")
+        print(f"[EMAIL] OK — enviado para {destino}")
         return True
 
-    except smtplib.SMTPAuthenticationError:
-        print("[EMAIL] ERRO: autenticacao Gmail falhou — verifique GMAIL_SENHA_APP")
-        return False
-    except smtplib.SMTPException as e:
-        print(f"[EMAIL] ERRO SMTP: {e}")
-        return False
     except Exception as e:
-        print(f"[EMAIL] ERRO inesperado: {e}")
+        print("[EMAIL ERRO REAL]:", repr(e))
         return False
 
 
-# Alias para compatibilidade interna
 def _enviar_email(para: str, assunto: str, html: str) -> tuple[bool, str]:
+    """Alias interno para compatibilidade com código existente."""
     ok = enviar_email(para, assunto, html)
     return ok, ("" if ok else "Falha ao enviar email")
 
@@ -652,360 +648,6 @@ async def verify_email(token: str):
     return HTMLResponse(content=html)
 
 
-@app.post("/v2/resend-verify")
-async def resend_verify(request: Request):
-    """
-    Reenviar email de verificação para contas não verificadas.
-    Útil quando o link expirou.
-    """
-    try:
-        body  = await request.json()
-        email = str(body.get("email", "")).strip().lower()
-
-        if not email:
-            return {"status": "error", "message": "Email obrigatório"}
-
-        db   = get_db()
-        user = db.users.find_one({"email": email})
-
-        # Segurança: não revelar se email existe ou não
-        if not user:
-            return {"status": "success", "message": "Se o email existir, você receberá um novo link."}
-
-        if user.get("is_verified"):
-            return {"status": "error", "message": "Esta conta já está verificada"}
-
-        # Gerar novo token
-        new_token  = secrets.token_urlsafe(32)
-        new_expira = datetime.utcnow() + timedelta(hours=VERIFY_HOURS)
-
-        db.users.update_one(
-            {"email": email},
-            {"$set": {"verify_token": new_token, "verify_expira": new_expira}}
-        )
-
-        enviar_email_verificacao(email, user.get("nome", ""), new_token)
-        return {"status": "success", "message": "Novo link de verificação enviado para seu email."}
-
-    except Exception as e:
-        traceback.print_exc()
-        return {"status": "error", "message": f"Erro: {str(e)}"}
-
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# V2 — OCR SEGURO VIA GEMINI (chave nunca exposta ao frontend)
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# OCR PIPELINE — QR → Gemini → Regex
-# ══════════════════════════════════════════════════════════════════════════════
-
-import re as _re
-from urllib.parse import urlparse, parse_qs as _parse_qs
-
-GEMINI_OCR_URL = (
-    "https://generativelanguage.googleapis.com/v1beta"
-    "/models/gemini-2.0-flash:generateContent"
-)
-
-PROMPT_OCR = (
-    "Analise este cupom fiscal brasileiro e retorne APENAS JSON puro, "
-    "sem markdown, sem explicação:\n"
-    '{"estabelecimento":"string ou null",'
-    '"valor_total":number ou null,'
-    '"data":"YYYY-MM-DD ou null"}\n'
-    "Regras: valor_total = TOTAL FINAL (ignorar subtotais e itens individuais). "
-    "Converter vírgula para ponto: 45,90→45.90. "
-    "Data em ISO: 23/03/2026→2026-03-23. "
-    "Retornar null para campos não encontrados."
-)
-
-# ── Normalização ──────────────────────────────────────────────────────────────
-
-def _norm_valor(v) -> float | None:
-    if v is None:
-        return None
-    try:
-        s = str(v).replace("R$", "").replace(" ", "").strip()
-        # 1.234,56 → 1234.56
-        if _re.match(r"^\d{1,3}(\.\d{3})+,\d{2}$", s):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", ".")
-        f = float(s)
-        return round(f, 2) if 0.01 < f < 100_000 else None
-    except Exception:
-        return None
-
-def _norm_data(s) -> str | None:
-    s = str(s or "").strip()
-    if not s or s == "None":
-        return None
-    m = _re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    m = _re.match(r"(\d{2})[/\-](\d{2})[/\-](\d{4})", s)
-    if m:
-        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-    return None
-
-def _sugerir_cat(nome: str) -> str:
-    n = (nome or "").lower()
-    if any(x in n for x in ["posto", "gnv", "combusti", "gasolina", "etanol",
-                              "ipiranga", "shell", "petrobras"]):
-        return "combustivel"
-    if any(x in n for x in ["mecanica", "auto ", "pneu", "borracha",
-                              "oficina", "manutencao"]):
-        return "manutencao"
-    if any(x in n for x in ["detran", "ipva", "iptu", "multa", "tributo"]):
-        return "impostos"
-    return "outros"
-
-# ── Fonte 1: QR Code ──────────────────────────────────────────────────────────
-
-def _qr_extrair(url: str) -> dict:
-    """Extrai vNF/dEmi/xNome diretamente da URL sem depender da SEFAZ."""
-    r = {"estabelecimento": None, "valor_total": None, "data": None}
-    if not url or not url.startswith("http"):
-        return r
-    try:
-        params = _parse_qs(urlparse(url).query)
-        for k in ["vNF", "vnf", "vNf", "vTotNF"]:
-            if k in params:
-                v = _norm_valor(params[k][0])
-                if v:
-                    r["valor_total"] = v
-                    break
-        for k in ["dEmi", "demi", "dhEmi"]:
-            if k in params:
-                d = _norm_data(params[k][0])
-                if d:
-                    r["data"] = d
-                    break
-        for k in ["xNome", "xnome", "razaoSocial"]:
-            if k in params:
-                nome = params[k][0]
-                if len(nome) > 2:
-                    r["estabelecimento"] = nome
-                    break
-        print(f"[QR] {r}")
-    except Exception as e:
-        print(f"[QR] erro: {e}")
-    return r
-
-# ── Fonte 2: Gemini ───────────────────────────────────────────────────────────
-
-
-def _comprimir_imagem(raw: bytes, mime: str, max_lado: int = 800, qualidade: int = 60) -> tuple[bytes, str]:
-    """
-    Comprime imagem para máx 800px e qualidade 60%.
-    Reduz de ~10MB para ~100KB — 100x menos tokens no Gemini.
-    Retorna (bytes_comprimidos, mime_type).
-    """
-    try:
-        from PIL import Image
-        img = Image.open(io.BytesIO(raw))
-
-        # Converter para RGB se necessário (PNG com transparência, etc)
-        if img.mode not in ('RGB', 'L'):
-            img = img.convert('RGB')
-
-        # Redimensionar mantendo proporção
-        w, h = img.size
-        if w > max_lado or h > max_lado:
-            ratio = max_lado / max(w, h)
-            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
-
-        # Salvar como JPEG comprimido
-        buf = io.BytesIO()
-        img.save(buf, format='JPEG', quality=qualidade, optimize=True)
-        buf.seek(0)
-        resultado = buf.read()
-        print(f"[COMPRESS] {len(raw)//1024}KB → {len(resultado)//1024}KB ({img.size[0]}x{img.size[1]}px)")
-        return resultado, 'image/jpeg'
-
-    except Exception as e:
-        print(f"[COMPRESS] Erro ao comprimir: {e} — usando original")
-        return raw, mime
-
-async def _gemini_ocr(b64: str, mime: str, key: str) -> tuple[dict, str]:
-    """
-    Gemini 1.5-flash, temp=0, timeout=30s.
-    Envia payload como bytes (evita serialização JSON de imagens grandes).
-    Retorna (dados, texto_bruto).
-    """
-    vazio = {"estabelecimento": None, "valor_total": None, "data": None}
-    texto = ""
-
-    if not key:
-        print("[GEMINI] sem chave — pulando")
-        return vazio, ""
-
-    # Comprimir imagem antes de enviar ao Gemini
-    raw_bytes = base64.b64decode(b64)
-    raw_bytes, mime = _comprimir_imagem(raw_bytes, mime)
-    b64 = base64.b64encode(raw_bytes).decode("utf-8")
-
-    # Rotação de chaves — tenta extras se principal estiver com 429
-    chaves_extras = [
-        os.environ.get("GEMINI_API_KEY_1", ""),
-        os.environ.get("GEMINI_API_KEY_2", ""),
-    ]
-    chaves_disponiveis = [key] + [k for k in chaves_extras if k]
-
-    b64_kb = len(b64) // 1024
-    print(f"[GEMINI] iniciando | imagem: {b64_kb}KB b64 | mime: {mime} | chaves: {len(chaves_disponiveis)}")
-
-    try:
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"inline_data": {"mime_type": mime, "data": b64}},
-                    {"text": PROMPT_OCR}
-                ]
-            }],
-            "generationConfig": {
-                "temperature":      0,
-                "responseMimeType": "application/json",
-            }
-        }
-
-        # Serializar manualmente para bytes — evita problema com payloads grandes
-        import json as _json
-        payload_bytes = _json.dumps(payload).encode("utf-8")
-        print(f"[GEMINI] payload serializado: {len(payload_bytes)//1024}KB")
-
-        resp = None
-        chave_usada = None
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as cli:
-            for idx_chave, chave_atual in enumerate(chaves_disponiveis):
-                resp = await cli.post(
-                    f"{GEMINI_OCR_URL}?key={chave_atual}",
-                    content=payload_bytes,
-                    headers={"Content-Type": "application/json"}
-                )
-                if resp.status_code == 429:
-                    print(f"[GEMINI] chave {idx_chave+1} com 429 — tentando próxima")
-                    continue
-                chave_usada = idx_chave + 1
-                break
-
-        if resp is None or resp.status_code == 429:
-            print(f"[GEMINI] todas as {len(chaves_disponiveis)} chave(s) com 429")
-            return vazio, ""
-
-        print(f"[GEMINI] HTTP {resp.status_code} | chave {chave_usada}")
-
-        if not resp.is_success:
-            body_preview = resp.text[:200]
-            print(f"[GEMINI] erro body: {body_preview}")
-            return vazio, ""
-
-        resp_json = resp.json()
-        texto = (resp_json
-                 .get("candidates", [{}])[0]
-                 .get("content", {})
-                 .get("parts", [{}])[0]
-                 .get("text", ""))
-
-        print(f"[GEMINI] texto recebido: {len(texto)} chars | preview: {texto[:80]}")
-
-        if not texto:
-            print("[GEMINI] texto vazio — Gemini não retornou nada")
-            return vazio, ""
-
-        # Parse JSON — limpar markdown se presente
-        clean = _re.sub(r"```json\s*|\s*```", "", texto).strip()
-        parsed = json.loads(clean)
-
-        dados = {
-            "estabelecimento": parsed.get("estabelecimento") or None,
-            "valor_total":     _norm_valor(parsed.get("valor_total")),
-            "data":            _norm_data(str(parsed.get("data") or "")),
-        }
-        print(f"[GEMINI] OK: {dados}")
-        return dados, texto
-
-    except httpx.TimeoutException:
-        print(f"[GEMINI] TIMEOUT após 30s | b64={b64_kb}KB")
-        return vazio, texto
-    except json.JSONDecodeError as je:
-        print(f"[GEMINI] JSON inválido: {je} | texto: {texto[:100]}")
-        return vazio, texto
-    except Exception as e:
-        print(f"[GEMINI] ERRO inesperado: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
-        return vazio, texto
-
-# ── Fonte 3: Regex ────────────────────────────────────────────────────────────
-
-def _regex_extrair(texto: str) -> dict:
-    """
-    Sempre executa se algum campo estiver faltando.
-    Funciona mesmo sem nenhuma API disponível.
-    """
-    r = {"estabelecimento": None, "valor_total": None, "data": None}
-    if not texto:
-        return r
-
-    # Valor — padrões em ordem de confiança decrescente
-    for p in [
-        r"(?:VALOR\s+TOTAL|TOTAL\s+A\s+PAGAR|VL\.?\s*TOTAL|TOTAL\s+GERAL)"
-        r"\s*[:\-]?\s*R?\$?\s*([\d]{1,3}(?:\.[\d]{3})*[,\.][\d]{2})",
-        r"(?<!\d)([\d]{1,3}(?:\.[\d]{3})*,[\d]{2})(?!\d)",
-        r"R\$\s*([\d]+[,\.][\d]{2})",
-    ]:
-        ms = _re.findall(p, texto, _re.IGNORECASE | _re.MULTILINE)
-        vs = [_norm_valor(m) for m in ms]
-        vs = [v for v in vs if v]
-        if vs:
-            r["valor_total"] = max(vs)
-            break
-
-    # Data
-    m = _re.search(r"(\d{2})[/\-](\d{2})[/\-](\d{4})", texto)
-    if m:
-        r["data"] = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-
-    # Estabelecimento — primeiras linhas não numéricas
-    linhas = [l.strip() for l in texto.split("\n")
-              if l.strip() and len(l.strip()) > 3
-              and not _re.match(r"^[\d\.\-/:\s]+$", l.strip())]
-    for linha in linhas[:6]:
-        if len(linha) < 80 and not _re.match(r"^\d{2}[/\-]\d{2}", linha):
-            r["estabelecimento"] = linha
-            break
-
-    print(f"[REGEX] {r}")
-    return r
-
-# ── Mesclagem ─────────────────────────────────────────────────────────────────
-
-def _mesclar(fontes: list[tuple[str, dict]]) -> tuple[dict, list[str]]:
-    """
-    Mescla resultados campo a campo com prioridade da lista.
-    Ex: Gemini trouxe valor, regex trouxe estabelecimento → ambos usados.
-    """
-    final = {"estabelecimento": None, "valor_total": None, "data": None}
-    usadas: list[str] = []
-    for nome, dados in fontes:
-        contribuiu = False
-        for campo in ["estabelecimento", "valor_total", "data"]:
-            if final[campo] is None and dados.get(campo) is not None:
-                final[campo] = dados[campo]
-                contribuiu = True
-        if contribuiu and nome not in usadas:
-            usadas.append(nome)
-        if all(final[c] is not None for c in final):
-            break   # todos preenchidos — parar
-    return final, usadas
-
-# ── Endpoint /v2/ocr ──────────────────────────────────────────────────────────
-
 @app.post("/v2/ocr")
 async def ocr_cupom(imagem: UploadFile = File(...), qr_url: str = Form(default="")):
     """
@@ -1114,12 +756,11 @@ async def debug_email():
     usuario = os.environ.get("GMAIL_USER", "")
     senha   = os.environ.get("GMAIL_SENHA_APP", "")
     return {
-        "status":           "ok",
-        "gmail_user":       usuario[:20] + "..." if usuario else "NAO_CONFIGURADO",
-        "gmail_senha_app":  "configurada" if senha else "NAO_CONFIGURADA",
-        "provedor":         "Gmail SMTP 587/STARTTLS",
+        "status":          "ok",
+        "gmail_user":      (usuario[:6] + "...") if usuario else "NAO_CONFIGURADO",
+        "gmail_senha_app": "configurada" if senha else "NAO_CONFIGURADA",
+        "provedor":        "Gmail SMTP 587/STARTTLS",
     }
-
 
 
 @app.post("/v2/test-email")
