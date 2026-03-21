@@ -249,7 +249,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": "MUTY Transporte API", "versao": "2.1"}
+    return {"status": "ok", "app": "MUTY Transporte API", "versao": "2.2", "build": "20260321-0209"}
 
 @app.get("/health/db")
 def health_db():
